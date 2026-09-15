@@ -516,6 +516,14 @@ with tab_trends:
                 )
             fig.update_layout(**PLOTLY_LAYOUT, height=380)
             st.plotly_chart(fig, width='stretch')
+            st.caption(
+                "One line per selected vendor: how many vulnerabilities were "
+                "published against its products each year. A vendor climbing "
+                "here usually means wider product coverage or more security "
+                "research attention, not necessarily worse engineering — "
+                "widely-audited software reports more. The shaded years are "
+                "undercounted, so read the tail of every line as a floor."
+            )
         else:
             st.info("Select at least one vendor above.")
 
@@ -535,6 +543,14 @@ with tab_trends:
         fig.update_layout(**PLOTLY_LAYOUT, height=380, barmode="stack")
         fig.update_xaxes(type="category")
         st.plotly_chart(fig, width='stretch')
+        st.caption(
+            "Each bar is one year split into severity bands, as a share rather "
+            "than a count, so years of very different volume stay comparable. "
+            "Watch the CRITICAL and HIGH bands: the mix shifting upward means "
+            "the average disclosure is getting more serious, independently of "
+            "how many there are. UNSCORED is awaiting a severity rating, which "
+            "is why it grows in the most recent years."
+        )
 
     st.markdown("**CWE category trend**")
     top_cwes_overall = (
@@ -554,6 +570,14 @@ with tab_trends:
         )
         fig.update_layout(**PLOTLY_LAYOUT, height=340)
         st.plotly_chart(fig, width='stretch')
+        st.caption(
+            "One line per weakness type: how many vulnerabilities were "
+            "classified as that kind of flaw each year. Each vulnerability "
+            "counts once, under its primary classification. Rising lines are "
+            "the bug classes the industry is currently producing most of — "
+            "useful for deciding what to train for or lint against. Unlike the "
+            "vendor chart, this is not affected by the recent-year gap."
+        )
     else:
         st.info("Select at least one CWE category above.")
 
@@ -586,6 +610,16 @@ with tab_archetypes:
     )
     fig.update_layout(**PLOTLY_LAYOUT, height=520)
     st.plotly_chart(fig, width='stretch')
+    st.caption(
+        "Each vendor's mix of weakness types is compressed onto two axes, so "
+        "distance is the only thing that carries meaning here — near "
+        "neighbours fail in similar ways. The axes themselves (PC1, PC2) are "
+        "blended combinations of weakness categories and have no unit, so do "
+        "not read a position as a score. Hover for the vendor name; dot size "
+        "is total vulnerability count. Only vendors with at least 20 "
+        "vulnerabilities are placed, since a handful of records cannot "
+        "describe a profile."
+    )
 
     st.markdown("**Inspect a vendor's category profile**")
     inspect_vendor = st.selectbox("Vendor", options=sorted(data["vendor_map"]["vendor"].unique()))
@@ -600,6 +634,15 @@ with tab_archetypes:
     fig2.update_traces(marker_color=ARCHETYPE_COLORS.get(vrow["archetype_label"], COLORS["signal"]))
     fig2.update_layout(**PLOTLY_LAYOUT, height=340)
     st.plotly_chart(fig2, width='stretch')
+    st.caption(
+        f"The ten weakness types that make up the largest share of "
+        f"**{inspect_vendor}**'s vulnerabilities. Bars are proportions of that "
+        f"vendor's own total, not absolute counts, so a small vendor and a "
+        f"large one can be compared directly. This is the profile that decided "
+        f"the dot's position above — \"Other\" dominating means the "
+        f"vendor's flaws are spread thin across many categories rather than "
+        f"concentrated in a recognisable pattern."
+    )
 
 # ---------------------------------------------------------------------------
 # Tab 3 -- CWE Co-occurrence Network (signature view)
@@ -660,6 +703,17 @@ with tab_network:
         height=640,
     )
     st.plotly_chart(fig, width='stretch')
+    st.caption(
+        "Each dot is a weakness type; a line means both were found in the same "
+        "product. Dot size is how often the weakness occurs, colour is how "
+        "central it is — and the two disagree more often than you would "
+        "expect, which is the point. A large pale dot is common but isolated: "
+        "it shows up on its own, so fixing it fixes one thing. A small warm dot "
+        "is rarer but sits at a hub, appearing alongside many other flaw types, "
+        "which tends to mean a shared root cause worth addressing. Hover for "
+        "exact figures. Position has no units — only proximity and "
+        "connections carry meaning."
+    )
 
 # ---------------------------------------------------------------------------
 # Tab 4 -- Centrality over time
@@ -698,6 +752,14 @@ with tab_centrality:
             fig.update_layout(**PLOTLY_LAYOUT, height=380)
             fig.update_xaxes(type="category")
             st.plotly_chart(fig, width='stretch')
+            st.caption(
+                "One line per weakness type, showing how central it was in each "
+                "year's network. Higher means it kept company with more other "
+                "flaw types that year. The scale is relative — all types in "
+                "a year sum to a fixed total — so a line falling does not "
+                "mean the weakness got rarer, only that others became better "
+                "connected. Compare shapes, not absolute heights."
+            )
         else:
             st.info("Select at least one CWE category above.")
 
@@ -716,6 +778,14 @@ with tab_centrality:
         )
         fig.update_layout(**PLOTLY_LAYOUT, height=380, showlegend=False)
         st.plotly_chart(fig, width='stretch')
+        st.caption(
+            f"The five weakness types that gained the most network centrality "
+            f"between {ts_prev} and {ts_latest}, and the five that lost the most. "
+            f"Green bars extend right (gained), red bars left (lost). A gain "
+            f"means the weakness started appearing alongside a wider range of "
+            f"other flaw types — an early signal that it is spreading into "
+            f"new kinds of software, which often precedes a rise in raw counts."
+        )
 
     st.markdown("---")
     st.markdown("**Can this year's network position predict next year's?**")
@@ -769,6 +839,16 @@ with tab_centrality:
                        xaxis_title=f"Actual {_target_year} centrality",
                        yaxis_title=f"Predicted {_target_year} centrality")
     st.plotly_chart(fig, width='stretch')
+    st.caption(
+        f"Each dot is one weakness type: what the model predicted its "
+        f"{_target_year} centrality would be (vertical) against what it turned "
+        f"out to be (horizontal). The dashed line is a perfect prediction — "
+        f"dots on it were called exactly right, dots above it were "
+        f"over-predicted, below under-predicted. Hover for the weakness type. "
+        f"The tight diagonal cluster is less impressive than it looks: the "
+        f"model mostly repeats the previous year's value, and most weakness "
+        f"types genuinely do not move much year to year."
+    )
 
 # ---------------------------------------------------------------------------
 # Tab 5 -- Data coverage
@@ -822,6 +902,15 @@ with tab_coverage:
             fig.update_layout(**PLOTLY_LAYOUT, height=380)
             fig.update_yaxes(range=[0, 100])
             st.plotly_chart(fig, width='stretch')
+            st.caption(
+                "What percentage of each year's vulnerabilities carry the "
+                "enrichment the dashboard depends on. Orange is vendor/product "
+                "data, teal is weakness classification. The dotted line marks "
+                "where a year stops being complete enough to compare. The two "
+                "lines diverging at the right edge is the whole story: recent "
+                "vulnerabilities get classified by weakness type promptly, but "
+                "wait much longer to be linked to a vendor and product."
+            )
 
     with right:
         with st.container(border=True):
@@ -838,7 +927,12 @@ with tab_coverage:
             fig.update_layout(**PLOTLY_LAYOUT, height=380, barmode="overlay")
             st.plotly_chart(fig, width='stretch')
             st.caption(
-                "The gap between the bars is what vendor-based views cannot see."
+                "Grey is everything published that year; teal is the portion "
+                "that can be attributed to a vendor and product. The gap "
+                "between them is what every vendor-based view in this "
+                "dashboard cannot see. Note that grey keeps climbing while "
+                "teal flattens — disclosures are accelerating, and it is "
+                "only attribution that has stalled."
             )
 
     with st.container(border=True):
@@ -859,6 +953,14 @@ with tab_coverage:
                 "cwe_coverage_pct": st.column_config.ProgressColumn(
                     "CWE coverage", format="%.1f%%", min_value=0, max_value=100),
             },
+        )
+        st.caption(
+            "The same figures exactly, newest first. **Published** is every "
+            "vulnerability recorded for that year; **With CPE** how many name a "
+            "vendor and product; **With CWE** how many carry a specific weakness "
+            "classification. Use this to sanity-check any number you take from "
+            "elsewhere in the dashboard — if a year's CPE coverage is low, "
+            "treat its vendor figures as partial."
         )
 
 # ---------------------------------------------------------------------------
