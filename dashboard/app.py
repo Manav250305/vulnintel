@@ -998,15 +998,15 @@ with tab_assistant:
                 help="Served by your local Ollama install.",
             )
 
-        briefing = assistant.build_briefing()
-
         with st.expander("What the assistant can see", icon=":material/description:"):
             st.caption(
-                "This briefing is rebuilt from the database on every question. "
-                "The model gets nothing else, which is why it cannot invent "
-                "figures that contradict the dashboard."
+                "Rebuilt from the database for every question. The overview "
+                "below is always included; naming a vendor, weakness or year "
+                "in your question also pulls that entity's real figures in. "
+                "The model gets nothing else, so any answer can be checked "
+                "against this."
             )
-            st.code(briefing, language=None)
+            st.code(assistant.build_briefing(), language=None)
 
         if "chat" not in st.session_state:
             st.session_state.chat = []
@@ -1035,6 +1035,8 @@ with tab_assistant:
             with st.chat_message("user"):
                 st.markdown(question)
             with st.chat_message("assistant"):
+                # Built per question so entities named in it get looked up.
+                briefing = assistant.build_briefing(question)
                 answer = st.write_stream(
                     assistant.stream_answer(
                         question, model, briefing,

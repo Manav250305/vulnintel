@@ -11,11 +11,15 @@ model asked "which vendor had the most vulnerabilities" will happily invent a
 plausible name and count, so the figures are pre-computed and the model is told
 to refuse anything the briefing does not cover.
 """
+import functools
 import json
+import re
 import sqlite3
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+import cwe_names
 
 DASHBOARD_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = DASHBOARD_DIR.parent
@@ -27,17 +31,26 @@ REQUEST_TIMEOUT = 180
 
 SYSTEM_PROMPT = """You are a vulnerability-intelligence analyst assistant.
 
-You answer questions using ONLY the briefing below. It is computed directly from \
-the database and is the single source of truth.
+You answer using ONLY the briefing below. It is computed directly from the \
+database for this specific question and is the single source of truth.
 
 Rules:
-- Never invent numbers. Quote figures only if they appear in the briefing.
-- If the briefing does not contain the answer, say exactly what is missing and \
-suggest which part of the dashboard would show it. Do not guess.
-- Vendor and product figures from recent years are undercounted; whenever you \
-quote them for those years, say so.
-- Be concise and concrete. Prefer a short paragraph or a few bullets.
-- Do not describe your own reasoning or restate these rules.
+- Every figure you give must appear verbatim in the briefing. Never compute, \
+estimate, or adjust a number.
+- Numbers belong to the heading they appear under. A figure listed under an \
+overall total is NOT that of a particular vendor, weakness or year. If the \
+briefing has no section for what was asked, say so instead of borrowing the \
+nearest-looking numbers.
+- Only expand a CWE identifier into words if the briefing supplies that name. \
+Otherwise write the bare identifier, e.g. "CWE-1021". Never guess what a CWE \
+number means.
+- If the briefing does not answer the question, say plainly what is missing and \
+point to the dashboard tab that would show it. A short refusal is a correct \
+answer; a fabricated one is not.
+- Vendor and product figures for recent years are undercounted. Say so whenever \
+you quote them.
+- Be concise and concrete. A short paragraph or a few bullets.
+- Do not describe your reasoning or restate these rules.
 
 === BRIEFING ===
 {briefing}
@@ -54,16 +67,196 @@ def available_models():
     return [m["name"] for m in payload.get("models", [])]
 
 
+def _connect():
+    return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+
+
 def _fetch(conn, query, params=()):
     return conn.execute(query, params).fetchall()
 
 
-def build_briefing():
+@functools.lru_cache(maxsize=1)
+def _known_vendors():
+    """Vendors substantial enough to be worth name-matching in a question.
+
+    Matching against all 36k vendor strings produces constant false positives --
+    'one', 'go' and 'now' are all registered vendor names."""
+    with _connect() as conn:
+        rows = _fetch(conn, """
+            SELECT vendor, COUNT(DISTINCT cve_id) n FROM cve_cpe
+            GROUP BY vendor HAVING n >= 20
+        """)
+    return {v for v, _ in rows if len(v) >= 3}
+
+
+def find_entities(question):
+    """Vendors, weaknesses and years named in a question."""
+    lowered = question.lower()
+    words = re.findall(r"[a-z0-9][a-z0-9._-]*", lowered)
+
+    vendors = _known_vendors()
+    found_vendors = [w for w in dict.fromkeys(words) if w in vendors]
+    # Two-word vendor names ("trend micro") lose to single-token matching.
+    for a, b in zip(words, words[1:]):
+        for joined in (f"{a} {b}", f"{a}_{b}"):
+            if joined in vendors and joined not in found_vendors:
+                found_vendors.append(joined)
+
+    cwes = [f"CWE-{n}" for n in dict.fromkeys(re.findall(r"cwe[-\s]?(\d+)", lowered))]
+    years = [int(y) for y in dict.fromkeys(re.findall(r"\b(19[89]\d|20[0-4]\d)\b", lowered))]
+    return found_vendors[:3], cwes[:3], years[:3]
+
+
+def describe_vendor(conn, vendor):
+    """Everything the database knows about one vendor."""
+    total = _fetch(conn, "SELECT COUNT(DISTINCT cve_id) FROM cve_cpe WHERE vendor = ?",
+                   (vendor,))[0][0]
+    if not total:
+        return None
+
+    lines = [f"\n## Vendor profile: {vendor}",
+             f"{total:,} vulnerabilities across all years."]
+
+    shares = _fetch(conn, """
+        SELECT c.cwe_id, COUNT(DISTINCT c.cve_id) n
+        FROM v_canonical_cwe c
+        WHERE c.is_generic = 0 AND c.cve_id IN (
+            SELECT cve_id FROM cve_cpe WHERE vendor = ?)
+        GROUP BY c.cwe_id ORDER BY n DESC LIMIT 10
+    """, (vendor,))
+    classified = sum(n for _, n in shares)
+    if shares:
+        lines.append(f"\nMost common weakness types for {vendor} "
+                     f"(share of its {classified:,} classified vulnerabilities):")
+        mem = web = 0
+        for cwe, n in shares:
+            pct = 100.0 * n / classified
+            lines.append(f"  {cwe_names.label(cwe)}: {n:,} ({pct:.1f}%)")
+            if cwe in cwe_names.MEMORY_SAFETY:
+                mem += pct
+            elif cwe in cwe_names.WEB_INJECTION:
+                web += pct
+        lines.append(f"Of the ten above, memory-safety types account for "
+                     f"{mem:.1f}% and web/injection types {web:.1f}%.")
+
+    products = _fetch(conn, """
+        SELECT product, COUNT(DISTINCT cve_id) n FROM cve_cpe
+        WHERE vendor = ? GROUP BY product ORDER BY n DESC LIMIT 5
+    """, (vendor,))
+    if products:
+        lines.append(f"\nMost affected {vendor} products:")
+        lines.extend(f"  {p}: {n:,}" for p, n in products)
+
+    by_year = _fetch(conn, """
+        SELECT v.published_year, COUNT(DISTINCT p.cve_id) n
+        FROM cve_cpe p JOIN cves v ON p.cve_id = v.id
+        WHERE p.vendor = ? GROUP BY v.published_year
+        ORDER BY v.published_year DESC LIMIT 8
+    """, (vendor,))
+    if by_year:
+        lines.append(f"\n{vendor} vulnerabilities per year (recent years undercounted):")
+        lines.extend(f"  {y}: {n:,}" for y, n in by_year)
+
+    archetype = _vendor_archetype(vendor)
+    if archetype:
+        lines.append(f"\nArchetype group: {archetype}")
+    return "\n".join(lines)
+
+
+def _vendor_archetype(vendor):
+    path = DATA_DIR / "vendor_cluster_map.csv"
+    if not path.exists():
+        return None
+    import csv as _csv
+    with open(path) as f:
+        for row in _csv.DictReader(f):
+            if row["vendor"] == vendor:
+                return row["archetype_label"]
+    return None
+
+
+def describe_cwe(conn, cwe_id):
+    """Everything the database knows about one weakness type."""
+    # Canonical (one label per CVE), matching the trend views. Counting raw
+    # cve_cwe rows instead would double-count vulnerabilities that carry both a
+    # vendor and an NVD classification, and disagree with the vendor sections.
+    total = _fetch(conn, "SELECT COUNT(DISTINCT cve_id) FROM v_canonical_cwe WHERE cwe_id = ?",
+                   (cwe_id,))[0][0]
+    if not total:
+        return f"\n## {cwe_id}\nNo records carry this weakness identifier."
+
+    name = cwe_names.lookup(cwe_id)
+    lines = [f"\n## Weakness profile: {cwe_id}"]
+    lines.append(f"Official name: {name}" if name
+                 else "Official name: not available -- refer to it as "
+                      f"{cwe_id} without expanding it.")
+    lines.append(f"{total:,} vulnerabilities classified as this type.")
+
+    by_year = _fetch(conn, """
+        SELECT year, cve_count, pct_of_year, yoy_growth_pct
+        FROM v_cwe_year_trend WHERE cwe_id = ? ORDER BY year DESC LIMIT 8
+    """, (cwe_id,))
+    if by_year:
+        lines.append("\nPer year (count, share of that year, change vs prior year):")
+        for y, n, pct, growth in by_year:
+            g = f"{growth:+.0f}%" if growth is not None else "n/a"
+            lines.append(f"  {y}: {n:,} ({pct}% of year, {g})")
+
+    vendors = _fetch(conn, """
+        SELECT p.vendor, COUNT(DISTINCT p.cve_id) n
+        FROM cve_cpe p
+        WHERE p.cve_id IN (SELECT cve_id FROM v_canonical_cwe WHERE cwe_id = ?)
+        GROUP BY p.vendor ORDER BY n DESC LIMIT 8
+    """, (cwe_id,))
+    if vendors:
+        lines.append(f"\nVendors most affected by {cwe_id}:")
+        lines.extend(f"  {v}: {n:,}" for v, n in vendors)
+    return "\n".join(lines)
+
+
+def describe_year(conn, year):
+    rows = _fetch(conn, """
+        SELECT COUNT(DISTINCT c.id), COUNT(DISTINCT p.cve_id)
+        FROM cves c LEFT JOIN cve_cpe p ON p.cve_id = c.id
+        WHERE c.published_year = ?
+    """, (year,))[0]
+    if not rows[0]:
+        return f"\n## {year}\nNo records published in this year."
+
+    lines = [f"\n## Year in detail: {year}",
+             f"{rows[0]:,} published; {rows[1]:,} carry vendor data "
+             f"({100.0 * rows[1] / rows[0]:.1f}%)."]
+
+    top_cwe = _fetch(conn, """
+        SELECT cwe_id, cve_count, pct_of_year FROM v_cwe_year_trend
+        WHERE year = ? ORDER BY cve_count DESC LIMIT 8
+    """, (year,))
+    if top_cwe:
+        lines.append(f"\nMost common weakness types in {year}:")
+        lines.extend(f"  {cwe_names.label(c)}: {n:,} ({p}%)" for c, n, p in top_cwe)
+
+    top_vendor = _fetch(conn, """
+        SELECT vendor, COUNT(DISTINCT cve_id) n FROM cve_cpe
+        WHERE cve_id IN (SELECT id FROM cves WHERE published_year = ?)
+        GROUP BY vendor ORDER BY n DESC LIMIT 8
+    """, (year,))
+    if top_vendor:
+        lines.append(f"\nVendors with the most records in {year}:")
+        lines.extend(f"  {v}: {n:,}" for v, n in top_vendor)
+    return "\n".join(lines)
+
+
+def build_briefing(question=None):
     """Assemble the facts the model is allowed to speak from.
 
-    Kept to a few kilobytes: small models lose the thread of a long context,
-    and everything here has to survive being read by a 2B model."""
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    The overview below is always included. When a question names a vendor,
+    weakness or year, that entity is looked up and its real figures appended:
+    a fixed summary made the model borrow whatever numbers were nearest when
+    asked about something it did not cover, which is worse than refusing.
+
+    Still only a few kilobytes -- small models lose the thread of a long
+    context, and this has to survive being read by a 2B model."""
+    conn = _connect()
     lines = []
 
     total, y_min, y_max, newest = _fetch(conn, """
@@ -115,7 +308,7 @@ def build_briefing():
         SELECT cwe_id, cve_count, pct_of_year FROM v_cwe_year_trend
         WHERE year = ? ORDER BY cve_count DESC LIMIT 10
     """, (y_max,)):
-        lines.append(f"  {cwe}: {n:,} ({pct}% of the year)")
+        lines.append(f"  {cwe_names.label(cwe)}: {n:,} ({pct}% of the year)")
 
     lines.append(f"\n## Severity mix, {y_max}")
     for sev, n, pct in _fetch(conn, """
@@ -123,6 +316,21 @@ def build_briefing():
         WHERE year = ? ORDER BY cve_count DESC
     """, (y_max,)):
         lines.append(f"  {sev}: {n:,} ({pct}%)")
+
+    # Look up whatever this particular question is about. Without this the
+    # overview above is all the model has, and it will repurpose overall
+    # totals as if they belonged to the vendor or year that was asked about.
+    if question:
+        vendors, cwes, years = find_entities(question)
+        for vendor in vendors:
+            section = describe_vendor(conn, vendor)
+            if section:
+                lines.append(section)
+        for cwe in cwes:
+            lines.append(describe_cwe(conn, cwe))
+        for year in years:
+            if year != y_max:  # the overview already covers the newest year
+                lines.append(describe_year(conn, year))
 
     conn.close()
 
