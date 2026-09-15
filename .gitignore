@@ -1,0 +1,59 @@
+# --- Secrets -----------------------------------------------------------
+# Only .env.example is tracked. Never commit a real key.
+.env
+.streamlit/secrets.toml
+dashboard/.streamlit/secrets.toml
+
+# --- Python ------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# --- Source feeds ------------------------------------------------------
+# Re-downloaded on demand by sql/fetch_feeds.py. The bulk archive alone is
+# ~100MB, which is at GitHub's per-file limit and pointless to version.
+data/raw/
+
+# --- Built database ----------------------------------------------------
+# Rebuilt from the feeds by sql/ingest_all.py.
+data/processed/*.db
+data/processed/*.db-journal
+data/processed/*.db.bak-*
+
+# --- Machine-local pipeline state --------------------------------------
+data/processed/last_sync.json
+data/processed/feed_state.json
+dashboard/data/refresh_status.json
+dashboard/data/rebuild_state/
+
+# --- Regenerable model / analysis artifacts ----------------------------
+*.joblib
+nlp/tfidf_cache/
+models/data/
+clustering/data/
+octave/data/
+tableau/exports/
+
+# Superseded ingestion paths, kept locally for reference but not shipped:
+#   sql/ingest.py       per-year loader, replaced by ingest_all.py
+#   sql/ingest_live.py  NVD API sync, replaced by fetch_feeds.py
+sql/ingest.py
+sql/ingest_live.py
+
+# Note: dashboard/data/*.csv IS tracked. It is generated, but it is what the
+# dashboard reads, and keeping it means a fresh clone renders immediately
+# instead of requiring a ~40 minute rebuild first.
+
+# --- Personal working notes --------------------------------------------
+PHASE*_NOTES.md
+
+# --- Logs --------------------------------------------------------------
+*.log
+
+# --- OS ----------------------------------------------------------------
+.DS_Store

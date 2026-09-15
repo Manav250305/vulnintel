@@ -1,0 +1,21 @@
+# Versions are the ones this codebase is actually tested against.
+#
+# System dependencies (not pip-installable):
+#   GNU Octave  -- the power-iteration step.   brew install octave  |  apt install octave
+#   Ollama      -- optional, powers the "Ask the data" tab.  https://ollama.com
+
+# Ingestion
+ijson==3.5.1              # streams the ~3GB decompressed feed without loading it
+python-dotenv==1.2.2
+
+# Analysis
+pandas==2.3.3
+numpy==2.2.6
+scikit-learn==1.7.2
+scipy==1.15.3
+joblib==1.5.3
+networkx==3.4.2           # force-directed layout for the weakness network
+
+# Dashboard
+streamlit==1.62.0
+plotly==7.0.0
