@@ -44,8 +44,11 @@ nearest-looking numbers.
 - Only expand a CWE identifier into words if the briefing supplies that name. \
 Otherwise write the bare identifier, e.g. "CWE-1021". Never guess what a CWE \
 number means.
-- If the briefing does not answer the question, say plainly what is missing and \
-point to the dashboard tab that would show it. A short refusal is a correct \
+- When the briefing DOES have a section covering what was asked, answer from it \
+directly and completely. Do not refuse, hedge, or send the reader to an \
+external source for something the briefing already states.
+- Only when the briefing genuinely lacks the answer, say plainly what is missing \
+and point to the dashboard tab that would show it. A short refusal is a correct \
 answer; a fabricated one is not.
 - Vendor and product figures for recent years are undercounted. Say so whenever \
 you quote them.
@@ -190,6 +193,9 @@ def describe_cwe(conn, cwe_id):
     lines.append(f"Official name: {name}" if name
                  else "Official name: not available -- refer to it as "
                       f"{cwe_id} without expanding it.")
+    definition = cwe_names.describe(cwe_id)
+    if definition:
+        lines.append(f"What it is (MITRE's definition): {definition}")
     lines.append(f"{total:,} vulnerabilities classified as this type.")
 
     by_year = _fetch(conn, """
