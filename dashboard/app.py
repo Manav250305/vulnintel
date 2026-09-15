@@ -1028,6 +1028,9 @@ with tab_assistant:
 
         for turn in st.session_state.chat:
             with st.chat_message(turn["role"]):
+                if turn.get("reasoning"):
+                    with st.expander("Reasoning", icon=":material/neurology:"):
+                        st.markdown(turn["reasoning"])
                 st.markdown(turn["content"])
 
         if question := st.chat_input("Ask about vendors, weaknesses, severity or coverage"):
@@ -1035,12 +1038,43 @@ with tab_assistant:
             with st.chat_message("user"):
                 st.markdown(question)
             with st.chat_message("assistant"):
-                # Built per question so entities named in it get looked up.
-                briefing = assistant.build_briefing(question)
-                answer = st.write_stream(
-                    assistant.stream_answer(
-                        question, model, briefing,
-                        history=st.session_state.chat[:-1][-6:],  # keep the prompt small
-                    )
+                thinking_box = st.status("Working…", expanded=True)
+                with thinking_box:
+                    # The trace records the lookups that actually ran, so this
+                    # panel shows the real retrieval path rather than a story
+                    # the model tells about itself afterwards.
+                    trace = []
+                    briefing = assistant.build_briefing(question, trace=trace)
+                    for line in trace:
+                        st.markdown(f"- {line}")
+                    st.markdown(f"- Asking `{model}`…")
+                    thought_slot = st.empty()
+
+                # Lives outside the status so the answer stays put when the
+                # reasoning panel collapses.
+                answer_slot = st.empty()
+                answer, thoughts = "", ""
+                for kind, piece in assistant.stream_answer(
+                    question, model, briefing,
+                    history=st.session_state.chat[:-1][-6:],  # keep the prompt small
+                ):
+                    if kind == "thinking":
+                        thoughts += piece
+                        thought_slot.markdown("> " + thoughts.strip().replace("\n", "\n> "))
+                    else:
+                        answer += piece
+                        answer_slot.markdown(answer)
+
+                thinking_box.update(
+                    label=f"Checked {len(trace)} source"
+                          f"{'s' if len(trace) != 1 else ''} before answering",
+                    state="complete", expanded=False,
                 )
-            st.session_state.chat.append({"role": "assistant", "content": answer})
+
+            reasoning = "\n".join(f"- {line}" for line in trace)
+            if thoughts.strip():
+                reasoning += f"\n\n**Model's own reasoning**\n\n> " + \
+                    thoughts.strip().replace("\n", "\n> ")
+            st.session_state.chat.append(
+                {"role": "assistant", "content": answer, "reasoning": reasoning}
+            )

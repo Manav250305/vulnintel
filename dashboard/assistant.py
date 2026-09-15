@@ -246,7 +246,7 @@ def describe_year(conn, year):
     return "\n".join(lines)
 
 
-def build_briefing(question=None):
+def build_briefing(question=None, trace=None):
     """Assemble the facts the model is allowed to speak from.
 
     The overview below is always included. When a question names a vendor,
@@ -255,9 +255,18 @@ def build_briefing(question=None):
     asked about something it did not cover, which is worse than refusing.
 
     Still only a few kilobytes -- small models lose the thread of a long
-    context, and this has to survive being read by a 2B model."""
+    context, and this has to survive being read by a 2B model.
+
+    Pass `trace` (a list) to collect a step-by-step record of what was looked
+    up. That record is what the dashboard shows as the assistant's reasoning:
+    it is the retrieval that actually happened, not a narration asked of the
+    model after the fact."""
     conn = _connect()
     lines = []
+
+    def step(text):
+        if trace is not None:
+            trace.append(text)
 
     total, y_min, y_max, newest = _fetch(conn, """
         SELECT COUNT(*), MIN(published_year), MAX(published_year), MAX(published_date)
@@ -320,17 +329,39 @@ def build_briefing(question=None):
     # Look up whatever this particular question is about. Without this the
     # overview above is all the model has, and it will repurpose overall
     # totals as if they belonged to the vendor or year that was asked about.
+    step(f"Loaded overview: {total:,} records, {y_min}-{y_max}.")
+
     if question:
         vendors, cwes, years = find_entities(question)
+        named = []
+        if vendors:
+            named.append(f"vendor {', '.join(vendors)}")
+        if cwes:
+            named.append(f"weakness {', '.join(cwes)}")
+        if years:
+            named.append(f"year {', '.join(str(y) for y in years)}")
+        step(f"Scanned the question and matched {'; '.join(named)}." if named
+             else "Scanned the question: no specific vendor, weakness or year "
+                  "named, so only the overview applies.")
+
         for vendor in vendors:
             section = describe_vendor(conn, vendor)
             if section:
                 lines.append(section)
+                step(f"Pulled {vendor}'s weakness breakdown, top products and "
+                     f"yearly counts from the database.")
+            else:
+                step(f"No records found for '{vendor}'.")
         for cwe in cwes:
             lines.append(describe_cwe(conn, cwe))
+            name = cwe_names.lookup(cwe)
+            step(f"Pulled {cwe} history and affected vendors"
+                 + (f"; official name is '{name}'." if name
+                    else f"; no official name on file, so it stays unexpanded."))
         for year in years:
             if year != y_max:  # the overview already covers the newest year
                 lines.append(describe_year(conn, year))
+                step(f"Pulled {year} in detail.")
 
     conn.close()
 
@@ -376,11 +407,19 @@ def build_briefing(question=None):
             lines.append(f"  {r['cwe_id']}: centrality {float(r['centrality']):.4f}, "
                          f"{int(r['raw_frequency']):,} records")
 
-    return "\n".join(lines)
+    briefing = "\n".join(lines)
+    step(f"Assembled a {len(briefing):,}-character briefing. The model sees "
+         f"this and nothing else.")
+    return briefing
 
 
 def stream_answer(question, model, briefing, history=None):
-    """Yield the model's reply in chunks as Ollama produces them."""
+    """Yield ("thinking" | "answer", chunk) pairs as Ollama produces them.
+
+    Reasoning models (deepseek-r1, qwen3 and similar) wrap their working in
+    <think> tags and would otherwise dump it into the reply. Splitting the
+    stream lets the dashboard show it separately. Models without a reasoning
+    mode simply never emit the tag and yield only "answer"."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(briefing=briefing)}]
     for turn in (history or []):
         messages.append({"role": turn["role"], "content": turn["content"]})
@@ -397,6 +436,8 @@ def stream_answer(question, model, briefing, history=None):
         f"{OLLAMA_URL}/api/chat", data=payload,
         headers={"Content-Type": "application/json"},
     )
+    in_thought = False
+    buffer = ""
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
             for raw in resp:
@@ -406,13 +447,44 @@ def stream_answer(question, model, briefing, history=None):
                     chunk = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                piece = chunk.get("message", {}).get("content")
+
+                message = chunk.get("message", {})
+                # Newer Ollama builds expose reasoning as its own field.
+                reasoning = message.get("thinking") or message.get("reasoning")
+                if reasoning:
+                    yield "thinking", reasoning
+
+                piece = message.get("content")
                 if piece:
-                    yield piece
+                    # Tags can straddle chunk boundaries, so hold text back
+                    # until it is clear which side of a tag it belongs to.
+                    buffer += piece
+                    while True:
+                        marker = "</think>" if in_thought else "<think>"
+                        idx = buffer.find(marker)
+                        if idx == -1:
+                            break
+                        before, buffer = buffer[:idx], buffer[idx + len(marker):]
+                        if before:
+                            yield ("thinking" if in_thought else "answer"), before
+                        in_thought = not in_thought
+
+                    # A partial tag at the tail must wait for the next chunk.
+                    safe = len(buffer)
+                    for n in range(1, min(8, len(buffer)) + 1):
+                        if "<think>".startswith(buffer[-n:]) or "</think>".startswith(buffer[-n:]):
+                            safe = len(buffer) - n
+                            break
+                    if safe > 0:
+                        yield ("thinking" if in_thought else "answer"), buffer[:safe]
+                        buffer = buffer[safe:]
+
                 if chunk.get("done"):
+                    if buffer:
+                        yield ("thinking" if in_thought else "answer"), buffer
                     return
     except (urllib.error.URLError, OSError, TimeoutError) as e:
-        yield f"\n\n*Could not reach the local model: {e}*"
+        yield "answer", f"\n\n*Could not reach the local model: {e}*"
 
 
 if __name__ == "__main__":
