@@ -75,9 +75,12 @@ def main():
     for quarter, n_docs, vocab_size in summary:
         print(f"{quarter:>10} {n_docs:>7} {vocab_size:>11}")
 
-    # Sanity check: top terms by summed TF-IDF weight for the first and last quarter,
-    # as a quick eyeball check that vectorization is producing sensible vocabulary
-    for quarter in [quarters[0], quarters[-1]]:
+    # Sanity check: top terms by summed TF-IDF weight for the first and last
+    # quarter, as a quick eyeball check that the vocabulary looks sensible.
+    # Sampled from the quarters actually written, not every quarter in the
+    # database -- the earliest quarters are skipped above and have no cache.
+    vectorized = [q for q, _, _ in summary]
+    for quarter in dict.fromkeys([vectorized[0], vectorized[-1]]) if vectorized else []:
         cached = joblib.load(CACHE_DIR / f"{quarter}.joblib")
         vectorizer, matrix = cached["vectorizer"], cached["matrix"]
         term_weights = matrix.sum(axis=0).A1
