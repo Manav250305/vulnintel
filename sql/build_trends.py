@@ -58,6 +58,10 @@ def main():
         raise SystemExit(f"{DB_PATH} not found — run ingest_all.py first.")
 
     conn = sqlite3.connect(DB_PATH)
+    # Applied here as well as at ingest so an existing database picks it up on
+    # the next refresh: without it a long rebuild locks out the dashboard's
+    # readers entirely. Persists in the file once set.
+    conn.execute("PRAGMA journal_mode = WAL")
 
     check_years(conn)
     latest = conn.execute("SELECT MAX(published_year) FROM cves").fetchone()[0]

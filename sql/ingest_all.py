@@ -72,6 +72,11 @@ def main():
         DB_PATH.unlink()
 
     conn = sqlite3.connect(DB_PATH)
+    # Write-ahead logging so the dashboard can keep reading while a rebuild
+    # writes. In the default rollback mode a writer locks the file outright and
+    # even read-only connections fail, which took the whole dashboard down
+    # whenever a long stage was running. The setting persists in the file.
+    conn.execute("PRAGMA journal_mode = WAL")
     if not args.append:
         # Load only the table/index DDL, not the old scope-filtering view --
         # `cves_in_scope` is created as a passthrough below so Phase 2+ queries

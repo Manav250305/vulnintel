@@ -70,12 +70,33 @@ def available_models():
     return [m["name"] for m in payload.get("models", [])]
 
 
+class DataUnavailable(RuntimeError):
+    """The database could not be read right now, almost always because a
+    rebuild stage is holding the write lock."""
+
+
+# Long enough to ride out a batch commit, short enough that the page still
+# renders promptly when a rebuild really is holding the lock for a while.
+LOCK_WAIT_SECONDS = 8
+
+
 def _connect():
-    return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True,
+                               timeout=LOCK_WAIT_SECONDS)
+        conn.execute(f"PRAGMA busy_timeout = {LOCK_WAIT_SECONDS * 1000}")
+        return conn
+    except sqlite3.OperationalError as e:
+        raise DataUnavailable(str(e)) from e
 
 
 def _fetch(conn, query, params=()):
-    return conn.execute(query, params).fetchall()
+    try:
+        return conn.execute(query, params).fetchall()
+    except sqlite3.OperationalError as e:
+        # Surfaced as DataUnavailable so callers can show "a rebuild is
+        # running" rather than a traceback.
+        raise DataUnavailable(str(e)) from e
 
 
 @functools.lru_cache(maxsize=1)

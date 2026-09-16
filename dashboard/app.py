@@ -338,7 +338,8 @@ with st.sidebar:
     @st.fragment(run_every="4s")
     def rebuild_controls():
         any_running = any(rebuild.is_running(name) for name in rebuild.STAGES)
-        for name, spec in rebuild.STAGES.items():
+        for name in rebuild.recommended_order():
+            spec = rebuild.STAGES[name]
             state = rebuild.read_state(name)
             status = state["status"] if state else None
             running = status == "running"
@@ -354,6 +355,18 @@ with st.sidebar:
             with st.container(border=True):
                 st.markdown(f"{icon} **{spec['title']}**")
                 st.caption(f"{spec['blurb']} {spec['runtime']}.")
+
+                # Running a stage before its inputs are current produces
+                # output that looks fine but describes the wrong corpus, so
+                # say which stage to run first rather than letting it happen.
+                blockers = rebuild.blocking_dependencies(name)
+                if blockers and not running:
+                    for dependency, reason in blockers:
+                        st.caption(
+                            f":material/priority_high: Run "
+                            f"**{rebuild.STAGES[dependency]['title']}** first "
+                            f"— it {reason}."
+                        )
 
                 if running:
                     st.caption(f"Running since {_time_ago(state['started'])}.")
@@ -1006,7 +1019,14 @@ with tab_assistant:
                 "The model gets nothing else, so any answer can be checked "
                 "against this."
             )
-            st.code(assistant.build_briefing(), language=None)
+            try:
+                st.code(assistant.build_briefing(), language=None)
+            except assistant.DataUnavailable:
+                st.info(
+                    "The database is busy while a rebuild writes to it. "
+                    "The briefing will appear once that finishes.",
+                    icon=":material/hourglass:",
+                )
 
         if "chat" not in st.session_state:
             st.session_state.chat = []
@@ -1044,31 +1064,49 @@ with tab_assistant:
                     # panel shows the real retrieval path rather than a story
                     # the model tells about itself afterwards.
                     trace = []
-                    briefing = assistant.build_briefing(question, trace=trace)
+                    try:
+                        briefing = assistant.build_briefing(question, trace=trace)
+                    except assistant.DataUnavailable:
+                        briefing = None
                     for line in trace:
                         st.markdown(f"- {line}")
-                    st.markdown(f"- Asking `{model}`…")
+                    if briefing is None:
+                        st.markdown("- Database busy — a rebuild is writing to it.")
+                    else:
+                        st.markdown(f"- Asking `{model}`…")
                     thought_slot = st.empty()
 
                 # Lives outside the status so the answer stays put when the
                 # reasoning panel collapses.
                 answer_slot = st.empty()
                 answer, thoughts = "", ""
-                for kind, piece in assistant.stream_answer(
-                    question, model, briefing,
-                    history=st.session_state.chat[:-1][-6:],  # keep the prompt small
-                ):
-                    if kind == "thinking":
-                        thoughts += piece
-                        thought_slot.markdown("> " + thoughts.strip().replace("\n", "\n> "))
-                    else:
-                        answer += piece
-                        answer_slot.markdown(answer)
+                if briefing is None:
+                    # Answering without the briefing would mean answering from
+                    # the model's own recollection, which is the one thing this
+                    # assistant must never do.
+                    answer = ("The database is currently locked by a running "
+                              "rebuild, so I cannot read the figures needed to "
+                              "answer. Try again once it finishes — progress "
+                              "is shown in the sidebar.")
+                    answer_slot.markdown(answer)
+                else:
+                    for kind, piece in assistant.stream_answer(
+                        question, model, briefing,
+                        history=st.session_state.chat[:-1][-6:],  # keep the prompt small
+                    ):
+                        if kind == "thinking":
+                            thoughts += piece
+                            thought_slot.markdown("> " + thoughts.strip().replace("\n", "\n> "))
+                        else:
+                            answer += piece
+                            answer_slot.markdown(answer)
 
                 thinking_box.update(
-                    label=f"Checked {len(trace)} source"
-                          f"{'s' if len(trace) != 1 else ''} before answering",
-                    state="complete", expanded=False,
+                    label=(f"Checked {len(trace)} source"
+                           f"{'s' if len(trace) != 1 else ''} before answering"
+                           if briefing is not None else "Database unavailable"),
+                    state="complete" if briefing is not None else "error",
+                    expanded=False,
                 )
 
             reasoning = "\n".join(f"- {line}" for line in trace)

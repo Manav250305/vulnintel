@@ -36,12 +36,29 @@ PYTHON = str(VENV_PY if VENV_PY.exists() else sys.executable)
 # Each stage lists the commands to run in order, plus the dashboard files it
 # refreshes, so the UI can say what a rebuild actually changes.
 STAGES = {
+    "text": {
+        "title": "Description clustering",
+        "blurb": "Re-groups vulnerability descriptions by wording, quarter by "
+                 "quarter, and flags clusters whose labelling looks inconsistent. "
+                 "This is the slow one.",
+        "runtime": "~30-45 minutes",
+        "updates": [],
+        "depends_on": [],
+        "steps": [
+            ([PYTHON, "preprocess.py"], PROJECT_ROOT / "nlp"),
+            ([PYTHON, "vectorize.py"], PROJECT_ROOT / "nlp"),
+            ([PYTHON, "cluster.py"], PROJECT_ROOT / "nlp"),
+            ([PYTHON, "flag_drift.py"], PROJECT_ROOT / "nlp"),
+        ],
+        "artifacts": [],
+    },
     "network": {
         "title": "Weakness relationship network",
         "blurb": "Recomputes which weakness types co-occur in the same products "
                  "and scores how central each one is.",
         "runtime": "~2 minutes",
         "updates": ["CWE Co-occurrence"],
+        "depends_on": [],
         "steps": [
             ([PYTHON, "build_cooccurrence.py"], PROJECT_ROOT / "octave"),
             (["octave", "--no-gui", "--quiet", "power_iteration.m"], PROJECT_ROOT / "octave"),
@@ -56,6 +73,7 @@ STAGES = {
                  "into archetypes.",
         "runtime": "~2 minutes",
         "updates": ["Vendor Archetypes"],
+        "depends_on": [],
         "steps": [
             ([PYTHON, "build_vendor_features.py"], PROJECT_ROOT / "clustering"),
             ([PYTHON, "vendor_archetypes.py"], PROJECT_ROOT / "clustering"),
@@ -67,9 +85,12 @@ STAGES = {
     "centrality": {
         "title": "Centrality history and forecast",
         "blurb": "Rebuilds the per-year centrality series and retrains the "
-                 "next-year forecast. Needs the network stage to have run first.",
+                 "next-year forecast.",
         "runtime": "~2 minutes",
         "updates": ["Centrality Time Series"],
+        # Reads the fixed weakness index the network stage writes, and the
+        # clustering tables the text stage writes.
+        "depends_on": ["network", "text"],
         "steps": [
             ([PYTHON, "build_centrality_timeseries.py"], PROJECT_ROOT / "models"),
             ([PYTHON, "train_forecast.py"], PROJECT_ROOT / "models"),
@@ -82,24 +103,11 @@ STAGES = {
                  "vulnerability description, and re-measures its accuracy by year.",
         "runtime": "~5 minutes",
         "updates": [],
+        # Trains on the cleaned descriptions the text stage writes.
+        "depends_on": ["text"],
         "steps": [
             ([PYTHON, "build_dataset.py"], PROJECT_ROOT / "models"),
             ([PYTHON, "train_classifier.py"], PROJECT_ROOT / "models"),
-        ],
-        "artifacts": [],
-    },
-    "text": {
-        "title": "Description clustering",
-        "blurb": "Re-groups vulnerability descriptions by wording, quarter by "
-                 "quarter, and flags clusters whose labelling looks inconsistent. "
-                 "This is the slow one.",
-        "runtime": "~30-45 minutes",
-        "updates": [],
-        "steps": [
-            ([PYTHON, "preprocess.py"], PROJECT_ROOT / "nlp"),
-            ([PYTHON, "vectorize.py"], PROJECT_ROOT / "nlp"),
-            ([PYTHON, "cluster.py"], PROJECT_ROOT / "nlp"),
-            ([PYTHON, "flag_drift.py"], PROJECT_ROOT / "nlp"),
         ],
         "artifacts": [],
     },
@@ -162,6 +170,65 @@ def _write_state(name, **fields):
 def is_running(stage):
     state = read_state(stage)
     return bool(state and state.get("status") == "running")
+
+
+def _finished_at(stage):
+    state = read_state(stage)
+    if not state or state.get("status") != "complete" or not state.get("finished"):
+        return None
+    try:
+        return datetime.fromisoformat(state["finished"])
+    except ValueError:
+        return None
+
+
+def blocking_dependencies(stage):
+    """Dependencies that would make this stage's output wrong if run now.
+
+    Two ways a dependency can be a problem: it has never completed, so the
+    input file or table this stage reads is absent or left over from an older
+    dataset; or it completed before the most recent data refresh, so its output
+    describes a corpus that no longer matches the database. Both produce a
+    stage that runs cleanly and reports figures for the wrong data, which is
+    worse than failing."""
+    problems = []
+    data_changed = _last_refresh_time()
+
+    for dependency in STAGES[stage].get("depends_on", []):
+        finished = _finished_at(dependency)
+        if finished is None:
+            problems.append((dependency, "has not completed"))
+        elif data_changed and finished < data_changed:
+            problems.append((dependency, "last ran before the newest data arrived"))
+    return problems
+
+
+def _last_refresh_time():
+    path = DATA_DIR / "refresh_status.json"
+    if not path.exists():
+        return None
+    try:
+        status = json.loads(path.read_text())
+        return datetime.fromisoformat(status["finished"])
+    except (json.JSONDecodeError, OSError, KeyError, ValueError):
+        return None
+
+
+def recommended_order():
+    """Stage names in an order that satisfies every dependency."""
+    ordered, seen = [], set()
+
+    def visit(name):
+        if name in seen:
+            return
+        seen.add(name)
+        for dependency in STAGES[name].get("depends_on", []):
+            visit(dependency)
+        ordered.append(name)
+
+    for name in STAGES:
+        visit(name)
+    return ordered
 
 
 def start(stage):
@@ -259,10 +326,17 @@ def main():
     args = ap.parse_args()
 
     if args.list or not args.stage:
-        for name, spec in STAGES.items():
+        print("Run in this order after new data arrives "
+              f"({' -> '.join(recommended_order())}):\n")
+        for name in recommended_order():
+            spec = STAGES[name]
             state = read_state(name)
             status = state["status"] if state else "never run"
-            print(f"{name:<12} {spec['runtime']:<18} {status:<12} {spec['title']}")
+            needs = ", ".join(spec.get("depends_on", [])) or "-"
+            print(f"{name:<12} {spec['runtime']:<18} {status:<12} "
+                  f"needs: {needs:<16} {spec['title']}")
+            for dependency, reason in blocking_dependencies(name):
+                print(f"{'':<12} ^ '{dependency}' {reason}")
         return
 
     if args.detach:
