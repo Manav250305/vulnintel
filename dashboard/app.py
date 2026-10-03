@@ -420,17 +420,52 @@ st.markdown(
 st.write("")
 
 # ---------------------------------------------------------------------------
-# Stat cards
+# Period filter
 # ---------------------------------------------------------------------------
-top_vendor = data["vendor_year"][data["vendor_year"]["year"] == yr_max].nlargest(1, "cve_count")
-fastest_cwe = data["cwe_year"][(data["cwe_year"]["year"] == yr_max) &
-                                 (data["cwe_year"]["yoy_growth_pct"].notna())].nlargest(1, "yoy_growth_pct")
-
 COMPLETE_CPE_COVERAGE_PCT = 85.0  # below this, vendor counts are visibly short
+QUIET_YEAR_SHARE = 0.02  # a year under this share of the busiest one reads as flat
 
 cov = data["coverage"].sort_values("year")
-cov_recent = cov[cov["year"] >= yr_max - 9]
-latest_cov = cov[cov["year"] == yr_max].iloc[0]
+
+# NVD backdates its oldest records, so the early years hold a few hundred
+# entries against tens of thousands today. Charted in full they occupy a third
+# of the axis as a flat line and squash everything recent, so the default view
+# starts where the data becomes substantial. The full span stays selectable.
+_peak = cov["total_cves"].max()
+_substantial = cov[cov["total_cves"] >= QUIET_YEAR_SHARE * _peak]["year"]
+default_start = int(_substantial.min()) if not _substantial.empty else yr_min
+
+period = st.slider(
+    "Period shown", min_value=yr_min, max_value=yr_max,
+    value=(default_start, yr_max),
+    help="Applies to every chart below that is plotted over time.",
+)
+period_start, period_end = int(period[0]), int(period[1])
+
+
+def clip(frame, column="year"):
+    """Restrict a frame to the selected period."""
+    return frame[(frame[column] >= period_start) & (frame[column] <= period_end)]
+
+
+if (period_start, period_end) != (yr_min, yr_max):
+    st.caption(
+        f"Showing {period_start}–{period_end} of {yr_min}–{yr_max} "
+        f"available. Vendor groupings and the weakness network are pooled across "
+        f"all years and do not change with this setting."
+    )
+
+st.write("")
+
+# ---------------------------------------------------------------------------
+# Stat cards -- reported for the end of the selected period
+# ---------------------------------------------------------------------------
+top_vendor = data["vendor_year"][data["vendor_year"]["year"] == period_end].nlargest(1, "cve_count")
+fastest_cwe = data["cwe_year"][(data["cwe_year"]["year"] == period_end) &
+                                 (data["cwe_year"]["yoy_growth_pct"].notna())].nlargest(1, "yoy_growth_pct")
+
+cov_recent = cov[(cov["year"] <= period_end) & (cov["year"] >= period_end - 9)]
+latest_cov = cov[cov["year"] == period_end].iloc[0]
 
 # Walk back from the newest year while coverage stays low, so the flagged
 # span is the current backlog rather than every dip in NVD's history.
@@ -439,26 +474,31 @@ for _, row in cov.sort_values("year", ascending=False).iterrows():
     if row["cpe_coverage_pct"] >= COMPLETE_CPE_COVERAGE_PCT:
         break
     undercounted_from = int(row["year"])
-prev_total = cov[cov["year"] == yr_max - 1]["total_cves"].iloc[0]
-cve_growth = 100.0 * (latest_cov["total_cves"] - prev_total) / prev_total
+_prior = cov[cov["year"] == period_end - 1]
+prev_total = _prior["total_cves"].iloc[0] if not _prior.empty else None
+cve_growth = (100.0 * (latest_cov["total_cves"] - prev_total) / prev_total
+              if prev_total else None)
+cov_delta = (latest_cov["cpe_coverage_pct"] - _prior["cpe_coverage_pct"].iloc[0]
+             if not _prior.empty else None)
 
 with st.container(horizontal=True):
     st.metric(
-        f"CVEs published in {yr_max}", f"{int(latest_cov['total_cves']):,}",
-        f"{cve_growth:+.0f}% vs {yr_max - 1}", border=True,
+        f"CVEs published in {period_end}", f"{int(latest_cov['total_cves']):,}",
+        f"{cve_growth:+.0f}% vs {period_end - 1}" if cve_growth is not None else None,
+        border=True,
         chart_data=cov_recent["total_cves"].tolist(), chart_type="line",
     )
     st.metric(
-        f"Top vendor by CVEs, {yr_max}", top_vendor.iloc[0]["vendor"].title(),
+        f"Top vendor by CVEs, {period_end}", top_vendor.iloc[0]["vendor"].title(),
         f"{int(top_vendor.iloc[0]['cve_count']):,} CVEs", border=True, delta_color="off",
     )
     st.metric(
-        f"Fastest-growing CWE, {yr_max}", fastest_cwe.iloc[0]["cwe_id"],
+        f"Fastest-growing CWE, {period_end}", fastest_cwe.iloc[0]["cwe_id"],
         f"{fastest_cwe.iloc[0]['yoy_growth_pct']:+.0f}% YoY", border=True,
     )
     st.metric(
-        f"Vendor attribution, {yr_max}", f"{latest_cov['cpe_coverage_pct']:.0f}%",
-        f"{latest_cov['cpe_coverage_pct'] - cov[cov['year'] == yr_max - 1]['cpe_coverage_pct'].iloc[0]:+.0f} pts",
+        f"Vendor attribution, {period_end}", f"{latest_cov['cpe_coverage_pct']:.0f}%",
+        f"{cov_delta:+.0f} pts" if cov_delta is not None else None,
         border=True, help="Share of CVEs with CPE vendor/product data. NVD adds these "
                           "after publication, so recent years undercount vendor activity.",
         chart_data=cov_recent["cpe_coverage_pct"].tolist(), chart_type="line",
@@ -510,18 +550,18 @@ with tab_trends:
             default=top_vendors_overall[:5],
         )
         if selected_vendors:
-            vdf = data["vendor_year"][data["vendor_year"]["vendor"].isin(selected_vendors)]
+            vdf = clip(data["vendor_year"][data["vendor_year"]["vendor"].isin(selected_vendors)])
             fig = px.line(
                 vdf, x="year", y="cve_count", color="vendor", markers=True,
                 labels={"cve_count": "CVEs", "year": "Year"},
                 color_discrete_sequence=LINE_COLORS,
             )
-            if undercounted_from is not None:
+            if undercounted_from is not None and undercounted_from <= period_end:
                 # Vendor counts depend on CPE data NVD attaches late, so the
                 # tail of every vendor line bends down for reporting reasons
                 # rather than real ones. Mark it on the chart, not just in prose.
                 fig.add_vrect(
-                    x0=undercounted_from - 0.5, x1=yr_max + 0.5,
+                    x0=max(undercounted_from, period_start) - 0.5, x1=period_end + 0.5,
                     fillcolor=COLORS["muted"], opacity=0.12, line_width=0,
                     annotation_text="incomplete vendor data",
                     annotation_position="top left",
@@ -543,7 +583,7 @@ with tab_trends:
     with col_right:
         st.markdown("**Severity mix by year**")
         sev_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE", "UNSCORED"]
-        sdf = data["severity_year"].copy()
+        sdf = clip(data["severity_year"]).copy()
         sdf["severity"] = pd.Categorical(sdf["severity"], categories=sev_order, ordered=True)
         sdf = sdf.sort_values(["year", "severity"])
         sdf["year"] = sdf["year"].astype(str)  # bug fix: numeric year only showed
@@ -575,7 +615,7 @@ with tab_trends:
         default=[c for c in ["CWE-79", "CWE-352", "CWE-787"] if c in top_cwes_overall],
     )
     if selected_cwes:
-        cdf = data["cwe_year"][data["cwe_year"]["cwe_id"].isin(selected_cwes)]
+        cdf = clip(data["cwe_year"][data["cwe_year"]["cwe_id"].isin(selected_cwes)])
         fig = px.line(
             cdf, x="year", y="cve_count", color="cwe_id", markers=True,
             labels={"cve_count": "CVEs", "year": "Year", "cwe_id": "CWE"},
@@ -742,9 +782,12 @@ with tab_centrality:
         unsafe_allow_html=True,
     )
 
-    ts = data["centrality_ts"]
-    ts_latest = int(ts["year"].max())
-    ts_prev = int(ts[ts["year"] < ts_latest]["year"].max())
+    ts = clip(data["centrality_ts"])
+    # A one-year period leaves nothing to compare, so the movers panel below
+    # needs a guard rather than an empty pivot.
+    ts_years = sorted(ts["year"].unique()) if not ts.empty else []
+    ts_latest = int(ts_years[-1]) if ts_years else None
+    ts_prev = int(ts_years[-2]) if len(ts_years) > 1 else None
     col_left, col_right = st.columns([3, 2])
 
     with col_left:
@@ -777,28 +820,33 @@ with tab_centrality:
             st.info("Select at least one CWE category above.")
 
     with col_right:
-        st.markdown(f"**Biggest movers, {ts_prev} \u2192 {ts_latest}**")
-        piv = ts[ts["year"].isin([ts_prev, ts_latest])].pivot(index="cwe_id", columns="year", values="centrality")
-        piv = piv.dropna()
-        piv["change"] = piv[ts_latest] - piv[ts_prev]
-        movers = pd.concat([piv.nlargest(5, "change"), piv.nsmallest(5, "change")]).reset_index()
-        movers = movers.sort_values("change")
-        fig = px.bar(
-            movers, x="change", y="cwe_id", orientation="h",
-            color=movers["change"] > 0,
-            color_discrete_map={True: SEVERITY_COLORS["LOW"], False: SEVERITY_COLORS["CRITICAL"]},
-            labels={"change": "Centrality change", "cwe_id": ""},
-        )
-        fig.update_layout(**PLOTLY_LAYOUT, height=380, showlegend=False)
-        st.plotly_chart(fig, width='stretch')
-        st.caption(
-            f"The five weakness types that gained the most network centrality "
-            f"between {ts_prev} and {ts_latest}, and the five that lost the most. "
-            f"Green bars extend right (gained), red bars left (lost). A gain "
-            f"means the weakness started appearing alongside a wider range of "
-            f"other flaw types — an early signal that it is spreading into "
-            f"new kinds of software, which often precedes a rise in raw counts."
-        )
+        if ts_prev is None:
+            st.markdown("**Biggest movers**")
+            st.info("Select a period covering at least two years to compare movement.")
+        else:
+
+            st.markdown(f"**Biggest movers, {ts_prev} \u2192 {ts_latest}**")
+            piv = ts[ts["year"].isin([ts_prev, ts_latest])].pivot(index="cwe_id", columns="year", values="centrality")
+            piv = piv.dropna()
+            piv["change"] = piv[ts_latest] - piv[ts_prev]
+            movers = pd.concat([piv.nlargest(5, "change"), piv.nsmallest(5, "change")]).reset_index()
+            movers = movers.sort_values("change")
+            fig = px.bar(
+                movers, x="change", y="cwe_id", orientation="h",
+                color=movers["change"] > 0,
+                color_discrete_map={True: SEVERITY_COLORS["LOW"], False: SEVERITY_COLORS["CRITICAL"]},
+                labels={"change": "Centrality change", "cwe_id": ""},
+            )
+            fig.update_layout(**PLOTLY_LAYOUT, height=380, showlegend=False)
+            st.plotly_chart(fig, width='stretch')
+            st.caption(
+                f"The five weakness types that gained the most network centrality "
+                f"between {ts_prev} and {ts_latest}, and the five that lost the most. "
+                f"Green bars extend right (gained), red bars left (lost). A gain "
+                f"means the weakness started appearing alongside a wider range of "
+                f"other flaw types — an early signal that it is spreading into "
+                f"new kinds of software, which often precedes a rise in raw counts."
+            )
 
     st.markdown("---")
     st.markdown("**Can this year's network position predict next year's?**")
@@ -887,7 +935,7 @@ with tab_coverage:
             icon=":material/warning:",
         )
 
-    plot_cov = cov[cov["year"] >= 2005]
+    plot_cov = clip(cov)
     left, right = st.columns(2)
 
     with left:
@@ -950,7 +998,7 @@ with tab_coverage:
 
     with st.container(border=True):
         st.markdown("**Coverage by year**")
-        table = cov[cov["year"] >= 2015][
+        table = clip(cov)[
             ["year", "total_cves", "cves_with_cpe", "cpe_coverage_pct",
              "cves_with_cwe", "cwe_coverage_pct"]
         ].sort_values("year", ascending=False)
