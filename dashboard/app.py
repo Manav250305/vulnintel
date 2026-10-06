@@ -18,6 +18,8 @@ from pathlib import Path
 import sys
 
 import assistant
+import cve_lookup
+import cwe_names
 import rebuild
 from refresh_pipeline import refresh, STATUS_PATH
 
@@ -405,16 +407,20 @@ with st.sidebar:
 st.markdown('<div class="eyebrow">VULNINTEL // CWE STRUCTURAL ANALYSIS</div>', unsafe_allow_html=True)
 st.markdown('<h1 class="hero-title">Vulnerability Intelligence Dashboard</h1>', unsafe_allow_html=True)
 
-total_cves = int(data["vendor_year"]["cve_count"].sum())
-n_vendors = data["vendor_map"]["vendor"].nunique()
+# Records come from the coverage table, which counts every CVE once. Summing
+# vendor_year would count vendor-CVE pairs instead: a CVE affecting three
+# vendors three times, and one with no vendor data not at all.
+total_cves = int(data["coverage"]["total_cves"].sum())
+n_vendors = data["vendor_year"]["vendor"].nunique()
+n_profiled = data["vendor_map"]["vendor"].nunique()
 n_cwe = data["nodes"]["cwe_id"].nunique()
-yr_min, yr_max = int(data["vendor_year"]["year"].min()), int(data["vendor_year"]["year"].max())
+yr_min, yr_max = int(data["coverage"]["year"].min()), int(data["coverage"]["year"].max())
 
 st.markdown(
     f'<div class="data-readout">{yr_min}\u2013{yr_max}'
-    f'<span class="sep">·</span>{total_cves:,} VENDOR-CVE RECORDS'
-    f'<span class="sep">·</span>{n_vendors} VENDORS TRACKED'
-    f'<span class="sep">·</span>{n_cwe} CWE CATEGORIES</div>',
+    f'<span class="sep">·</span>{total_cves:,} VULNERABILITIES'
+    f'<span class="sep">·</span>{n_vendors:,} VENDORS ({n_profiled:,} PROFILED)'
+    f'<span class="sep">·</span>{n_cwe:,} WEAKNESS TYPES</div>',
     unsafe_allow_html=True,
 )
 st.write("")
@@ -546,6 +552,202 @@ PLOTLY_LAYOUT = dict(
     margin=dict(l=10, r=10, t=40, b=10),
 )
 
+# ---------------------------------------------------------------------------
+# Individual records -- the search box below and the drill-downs inside each
+# tab. Everything else on the page is aggregate; these show the records a
+# number was built from.
+# ---------------------------------------------------------------------------
+CPE_PART_LABELS = {"a": "Application", "o": "Operating system", "h": "Hardware"}
+DB_BUSY_MESSAGE = ("The database is busy while a rebuild writes to it. Try again "
+                   "once that finishes.")
+
+
+@st.cache_data(ttl=REFRESH_TTL_SECONDS, max_entries=256)
+def lookup_cve(cve_id):
+    return cve_lookup.lookup(cve_id)
+
+
+@st.cache_data(ttl=REFRESH_TTL_SECONDS, max_entries=64)
+def search_cves(**filters):
+    return cve_lookup.search(**filters)
+
+
+def render_cve_detail(cve_id):
+    """Everything stored for one record, and how it feeds the aggregate views."""
+    try:
+        record = lookup_cve(cve_id)
+    except cve_lookup.DataUnavailable:
+        st.info(DB_BUSY_MESSAGE, icon=":material/hourglass:")
+        return
+    if record is None:
+        st.info(f"**{cve_id}** is not in the database. It may have been published "
+                f"after the last refresh, or the ID may not be assigned yet.",
+                icon=":material/search_off:")
+        return
+
+    with st.container(border=True):
+        st.subheader(record["id"])
+        st.caption(f"NVD status: {record['status']}")
+        if record["status"] == "Rejected":
+            st.warning(
+                "NVD has rejected this ID, usually as a duplicate or a "
+                "non-vulnerability. It is still counted in the published-year "
+                "totals.", icon=":material/block:",
+            )
+
+        with st.container(horizontal=True):
+            score = record["cvss_score"]
+            version = (record["cvss_version"] or "").replace("v3", "v3.")
+            st.metric("CVSS base score",
+                      f"{score:.1f}" if score is not None else "Unscored",
+                      help=f"Scored with CVSS {version}. Where several versions "
+                           f"exist, the newest is used." if version else
+                           "No CVSS metrics have been published yet.",
+                      border=True)
+            st.metric("Severity", record["severity"] or "Unscored", border=True)
+            st.metric("Published", record["published"], border=True)
+            st.metric("Last modified", (record["last_modified"] or "—")[:10],
+                      border=True)
+
+        st.markdown("**Description**")
+        st.write(record["description"])
+
+        st.markdown("**Weakness types (CWE)**")
+        if record["cwes"]:
+            cwe_df = pd.DataFrame(record["cwes"])
+            cwe_df["name"] = cwe_df["cwe_id"].map(lambda c: cwe_names.lookup(c) or "")
+            st.dataframe(
+                cwe_df[["cwe_id", "name", "type", "source", "is_canonical"]],
+                hide_index=True, width='stretch',
+                column_config={
+                    "cwe_id": "CWE", "name": "Name", "type": "Type",
+                    "source": "Assigned by",
+                    "is_canonical": st.column_config.CheckboxColumn(
+                        "Counted in charts",
+                        help="The aggregate views count each vulnerability "
+                             "under one weakness only: NVD's primary "
+                             "assignment first, then any NVD assignment, "
+                             "then whatever remains."),
+                },
+            )
+            canonical = record["canonical_cwe"]
+            if len(record["cwes"]) > 1 and canonical:
+                st.caption(
+                    f"This record carries {len(record['cwes'])} weakness "
+                    f"assignments but is counted once, under {canonical}, in the "
+                    f"Trends, Vendor profiles and Weakness network tabs."
+                )
+            node = data["nodes"][data["nodes"]["cwe_id"] == canonical]
+            if not node.empty:
+                rank = int((data["nodes"]["centrality"] > node["centrality"].iloc[0]).sum()) + 1
+                st.caption(f"{canonical} ranks #{rank} of {len(data['nodes'])} weakness "
+                           f"types by centrality in the weakness network.")
+        else:
+            st.caption("No weakness type assigned yet.")
+
+        st.markdown("**Affected products (CPE)**")
+        if record["products"]:
+            prod_df = pd.DataFrame(record["products"])
+            prod_df["part"] = prod_df["part"].map(CPE_PART_LABELS).fillna(prod_df["part"])
+            st.dataframe(
+                prod_df[["vendor", "product", "version", "part"]],
+                hide_index=True, width='stretch',
+                column_config={
+                    "vendor": "Vendor", "product": "Product",
+                    "version": st.column_config.TextColumn(
+                        "Version", help="* means the record names a version "
+                                        "range rather than specific versions."),
+                    "part": "Kind",
+                },
+            )
+            vendors = sorted({p["vendor"] for p in record["products"]})
+            archetypes = data["vendor_map"][data["vendor_map"]["vendor"].isin(vendors)]
+            if not archetypes.empty:
+                groups = "; ".join(
+                    f"{label}: {', '.join(group['vendor'])}"
+                    for label, group in archetypes.groupby("archetype_label")
+                )
+                st.caption(f"Vendor profiles grouping — {groups}.")
+        else:
+            st.info(
+                "No vendor or product attached yet. NVD adds these after "
+                "publication, so this record counts toward its year's total "
+                "but toward no vendor.", icon=":material/link_off:",
+            )
+
+        if undercounted_from is not None and record["year"] >= undercounted_from:
+            year_cov = cov[cov["year"] == record["year"]]
+            if not year_cov.empty:
+                st.caption(
+                    f"Only {year_cov['cpe_coverage_pct'].iloc[0]:.1f}% of "
+                    f"{record['year']} records have vendor data so far, so vendor "
+                    f"figures for that year are incomplete. See Data coverage."
+                )
+
+
+def cve_browser(key, **filters):
+    """Records matching `filters` as a table; selecting a row opens it below.
+
+    Callers put this inside an expander opened with on_change="rerun" and only
+    call it while open, so a closed drill-down never touches the database.
+    """
+    order = st.segmented_control(
+        "Order", ["Newest first", "Most severe first"], default="Newest first",
+        key=f"{key}_order", label_visibility="collapsed",
+    ) or "Newest first"
+    try:
+        total, rows = search_cves(
+            **filters, order="severity" if order == "Most severe first" else "newest")
+    except cve_lookup.DataUnavailable:
+        st.info(DB_BUSY_MESSAGE, icon=":material/hourglass:")
+        return
+    if not rows:
+        st.caption("No records match.")
+        return
+
+    shown = len(rows)
+    st.caption(f"{total:,} matching record{'s' if total != 1 else ''}"
+               + (f", showing the first {shown}" if total > shown else "")
+               + ". Select a row to open it.")
+    table = pd.DataFrame(rows)
+    event = st.dataframe(
+        table[["id", "published", "severity", "cvss_score", "cwe_id", "vendors",
+               "description"]],
+        hide_index=True, width='stretch', height=320,
+        on_select="rerun", selection_mode="single-row", key=f"{key}_table",
+        column_config={
+            "id": "CVE", "published": "Published", "severity": "Severity",
+            "cvss_score": st.column_config.NumberColumn("CVSS", format="%.1f"),
+            "cwe_id": "CWE", "vendors": "Vendors",
+            "description": st.column_config.TextColumn("Description", width="large"),
+        },
+    )
+    selected = event.selection.rows
+    # A selection can outlive the rows it pointed at when the filters change.
+    if selected and selected[0] < shown:
+        render_cve_detail(table.iloc[selected[0]]["id"])
+
+
+def drilldown(label, key):
+    """A collapsed section whose contents only run while it is open."""
+    return st.expander(label, icon=":material/table_rows:", key=key, on_change="rerun")
+
+
+# ---------------------------------------------------------------------------
+# Search -- for when you know the ID, or only roughly what it was about
+# ---------------------------------------------------------------------------
+search_text = st.text_input(
+    "Find a vulnerability", key="cve_search",
+    placeholder="A CVE ID, or words from its description, e.g. log4j remote code execution",
+    help="An ID opens that record. Keywords must all appear in the description.",
+)
+if search_text.strip():
+    if cve_lookup.normalize_id(search_text):
+        render_cve_detail(cve_lookup.normalize_id(search_text))
+    else:
+        cve_browser("search", text=search_text)
+    st.write("")
+
 (tab_trends, tab_archetypes, tab_network, tab_centrality, tab_coverage,
  tab_assistant) = st.tabs([
     "Trends", "Vendor profiles", "Weakness network", "Centrality over time",
@@ -661,6 +863,27 @@ with tab_trends:
     else:
         st.info("Select at least one CWE category above.")
 
+    trends_drill = drilldown("Records behind these charts", key="trends_drill")
+    if trends_drill.open:
+        with trends_drill:
+            st.caption(f"Published {period_start}–{period_end}. Narrow to one of the "
+                       f"vendors or weakness types charted above.")
+            f_vendor, f_cwe = st.columns(2)
+            with f_vendor:
+                drill_vendor = st.selectbox(
+                    "Vendor", ["Any vendor"] + selected_vendors, key="trends_drill_vendor")
+            with f_cwe:
+                drill_cwe = st.selectbox(
+                    "Weakness type", ["Any weakness"] + selected_cwes,
+                    format_func=lambda c: c if c == "Any weakness" else cwe_names.label(c),
+                    key="trends_drill_cwe")
+            cve_browser(
+                "trends",
+                vendors=() if drill_vendor == "Any vendor" else (drill_vendor,),
+                cwe_ids=() if drill_cwe == "Any weakness" else (drill_cwe,),
+                year_from=period_start, year_to=period_end,
+            )
+
 # ---------------------------------------------------------------------------
 # Tab 2 -- Vendor Archetypes
 # ---------------------------------------------------------------------------
@@ -723,6 +946,24 @@ with tab_archetypes:
         f"vendor's flaws are spread thin across many categories rather than "
         f"concentrated in a recognisable pattern."
     )
+
+    vendor_drill = drilldown(f"{inspect_vendor}'s records", key="vendor_drill")
+    if vendor_drill.open:
+        with vendor_drill:
+            # "Other" is every weakness outside the top categories, not a CWE
+            # that can be filtered on.
+            profile_cwes = [c for c in profile.sort_values("share", ascending=False)["category"]
+                            if c != "Other"]
+            drill_cwe = st.selectbox(
+                "Weakness type", ["Any weakness"] + profile_cwes,
+                format_func=lambda c: c if c == "Any weakness" else cwe_names.label(c),
+                key="vendor_drill_cwe",
+                help="The bars above, largest first. All years, like the profile itself.",
+            )
+            cve_browser(
+                "vendor", vendors=(inspect_vendor,),
+                cwe_ids=() if drill_cwe == "Any weakness" else (drill_cwe,),
+            )
 
 # ---------------------------------------------------------------------------
 # Tab 3 -- CWE Co-occurrence Network (signature view)
@@ -794,6 +1035,17 @@ with tab_network:
         "exact figures. Position has no units — only proximity and "
         "connections carry meaning."
     )
+
+    network_drill = drilldown("Records for a weakness type", key="network_drill")
+    if network_drill.open:
+        with network_drill:
+            by_centrality = nodes_positioned.sort_values("centrality", ascending=False)["cwe_id"]
+            drill_cwe = st.selectbox(
+                "Weakness type", by_centrality.tolist(),
+                format_func=cwe_names.label, key="network_drill_cwe",
+                help="Most central first, matching the warmest dots above.",
+            )
+            cve_browser("network", cwe_ids=(drill_cwe,))
 
 # ---------------------------------------------------------------------------
 # Tab 4 -- Centrality over time
@@ -1051,6 +1303,16 @@ with tab_coverage:
             "treat its vendor figures as partial."
         )
 
+    coverage_drill = drilldown("Records still waiting for vendor data", key="coverage_drill")
+    if coverage_drill.open:
+        with coverage_drill:
+            drill_year = st.selectbox(
+                "Year", list(reversed(all_years)), key="coverage_drill_year",
+                help="These records count toward the year's total but toward no vendor.",
+            )
+            cve_browser("coverage", year_from=drill_year, year_to=drill_year,
+                        missing_vendor=True)
+
 # ---------------------------------------------------------------------------
 # Tab 6 -- Ask the data
 # ---------------------------------------------------------------------------
@@ -1089,8 +1351,8 @@ with tab_assistant:
         with st.expander("What the assistant can see", icon=":material/description:"):
             st.caption(
                 "Rebuilt from the database for every question. The overview "
-                "below is always included; naming a vendor, weakness or year "
-                "in your question also pulls that entity's real figures in. "
+                "below is always included; naming a CVE ID, vendor, weakness or "
+                "year in your question also pulls that entity's real figures in. "
                 "The model gets nothing else, so any answer can be checked "
                 "against this."
             )
@@ -1118,6 +1380,7 @@ with tab_assistant:
                 "Summarise how severity has shifted in the most recent year.",
                 "Which vendors look memory-safety heavy, and what does that mean?",
                 "Why did vendor counts drop after 2023?",
+                "Explain CVE-2021-44228 in plain English. How severe is it?",
             ]:
                 st.markdown(f"- {example}")
 

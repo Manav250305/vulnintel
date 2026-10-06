@@ -113,9 +113,17 @@ def _known_vendors():
     return {v for v, _ in rows if len(v) >= 3}
 
 
+CVE_IN_TEXT = re.compile(r"\bcve[-\s]?(\d{4})[-\s](\d{4,})\b")
+MAX_CVES_PER_QUESTION = 3
+
+
 def find_entities(question):
-    """Vendors, weaknesses and years named in a question."""
+    """CVE IDs, vendors, weaknesses and years named in a question."""
     lowered = question.lower()
+    cves = list(dict.fromkeys(f"CVE-{y}-{n}" for y, n in CVE_IN_TEXT.findall(lowered)))
+    # Strip the IDs before matching anything else: the 2026 inside
+    # CVE-2026-53900 is not a question about the year 2026.
+    lowered = CVE_IN_TEXT.sub(" ", lowered)
     words = re.findall(r"[a-z0-9][a-z0-9._-]*", lowered)
 
     vendors = _known_vendors()
@@ -128,7 +136,7 @@ def find_entities(question):
 
     cwes = [f"CWE-{n}" for n in dict.fromkeys(re.findall(r"cwe[-\s]?(\d+)", lowered))]
     years = [int(y) for y in dict.fromkeys(re.findall(r"\b(19[89]\d|20[0-4]\d)\b", lowered))]
-    return found_vendors[:3], cwes[:3], years[:3]
+    return cves[:MAX_CVES_PER_QUESTION], found_vendors[:3], cwes[:3], years[:3]
 
 
 def describe_vendor(conn, vendor):
@@ -273,6 +281,88 @@ def describe_year(conn, year):
     return "\n".join(lines)
 
 
+MAX_PRODUCTS_LISTED = 8
+MAX_VENDORS_LISTED = 10
+MAX_DESCRIPTION_CHARS = 1500
+
+
+def describe_cve(conn, cve_id):
+    """Everything the database holds for one vulnerability record."""
+    # Imported here, not at the top: cve_lookup takes its connection helpers
+    # from this module, so a top-level import would be circular.
+    import cve_lookup
+
+    record = cve_lookup.fetch_record(conn, cve_id)
+    if record is None:
+        return (f"\n## {cve_id}\nNot in the database. It may have been published "
+                f"after the last refresh, or the ID may not be assigned. Nothing "
+                f"is known about it here.")
+
+    lines = [f"\n## Vulnerability record: {cve_id}",
+             f"Published {record['published']}; last modified "
+             f"{(record['last_modified'] or 'unknown')[:10]}; NVD status: "
+             f"{record['status']}."]
+    if record["status"] == "Rejected":
+        lines.append("NVD has REJECTED this ID (usually a duplicate or not a real "
+                     "vulnerability). Say so before anything else.")
+
+    if record["cvss_score"] is not None:
+        version = {"v31": "3.1", "v30": "3.0", "v2": "2.0"}.get(record["cvss_version"],
+                                                                record["cvss_version"])
+        lines.append(f"Severity: {record['severity']}, CVSS {version} base score "
+                     f"{record['cvss_score']:.1f}.")
+    else:
+        lines.append("Severity: not scored yet.")
+
+    description = record["description"]
+    if len(description) > MAX_DESCRIPTION_CHARS:
+        description = description[:MAX_DESCRIPTION_CHARS].rsplit(" ", 1)[0] + " [truncated]"
+    lines.append(f"Description: {description}")
+
+    if record["cwes"]:
+        lines.append("\nWeakness classification:")
+        for cwe in record["cwes"]:
+            counted = (" -- the one this record is counted under in the trend "
+                       "figures" if cwe["is_canonical"] and len(record["cwes"]) > 1 else "")
+            lines.append(f"  {cwe_names.label(cwe['cwe_id'])}, {cwe['type'].lower()} "
+                         f"assignment{counted}")
+            definition = cwe_names.describe(cwe["cwe_id"])
+            if definition:
+                lines.append(f"    MITRE definition: {definition}")
+    else:
+        lines.append("\nWeakness classification: none assigned yet.")
+
+    products = record["products"]
+    if products:
+        vendors = sorted({p["vendor"] for p in products})
+        pairs = list(dict.fromkeys((p["vendor"], p["product"]) for p in products))
+        lines.append(f"\nAffected: {len(pairs)} product(s) from {len(vendors)} vendor(s).")
+        lines.append("Vendors: " + ", ".join(vendors[:MAX_VENDORS_LISTED])
+                     + (f", and {len(vendors) - MAX_VENDORS_LISTED} more"
+                        if len(vendors) > MAX_VENDORS_LISTED else ""))
+        lines.append("Products: " + ", ".join(f"{v} {p}" for v, p in pairs[:MAX_PRODUCTS_LISTED])
+                     + (f", and {len(pairs) - MAX_PRODUCTS_LISTED} more"
+                        if len(pairs) > MAX_PRODUCTS_LISTED else ""))
+        archetypes = [f"{v}: {a}" for v in vendors[:MAX_VENDORS_LISTED]
+                      if (a := _vendor_archetype(v))]
+        if archetypes:
+            lines.append("Vendor archetype groups: " + "; ".join(archetypes))
+    else:
+        lines.append("\nAffected products: none attached yet. NVD adds vendor and "
+                     "product data after publication.")
+    return "\n".join(lines)
+
+
+# Stated outright so the model refuses these instead of filling them in from
+# general knowledge -- while still quoting a description that mentions them.
+RECORD_LIMITS_NOTE = (
+    "\nAbout the vulnerability records above: the database does not store fixed "
+    "or patched versions, advisories or reference links, exploitation status, or "
+    "the CVSS vector breakdown as separate fields. Anything the description "
+    "itself states may be quoted from it; anything else on those topics is not "
+    "known here.")
+
+
 def build_briefing(question=None, trace=None):
     """Assemble the facts the model is allowed to speak from.
 
@@ -359,8 +449,10 @@ def build_briefing(question=None, trace=None):
     step(f"Loaded overview: {total:,} records, {y_min}-{y_max}.")
 
     if question:
-        vendors, cwes, years = find_entities(question)
+        cves, vendors, cwes, years = find_entities(question)
         named = []
+        if cves:
+            named.append(f"vulnerability {', '.join(cves)}")
         if vendors:
             named.append(f"vendor {', '.join(vendors)}")
         if cwes:
@@ -368,9 +460,17 @@ def build_briefing(question=None, trace=None):
         if years:
             named.append(f"year {', '.join(str(y) for y in years)}")
         step(f"Scanned the question and matched {'; '.join(named)}." if named
-             else "Scanned the question: no specific vendor, weakness or year "
-                  "named, so only the overview applies.")
+             else "Scanned the question: no specific vulnerability, vendor, "
+                  "weakness or year named, so only the overview applies.")
 
+        for cve_id in cves:
+            section = describe_cve(conn, cve_id)
+            lines.append(section)
+            step(f"Pulled {cve_id}'s record: severity, description, weakness "
+                 f"types and affected products." if "Vulnerability record" in section
+                 else f"{cve_id} is not in the database.")
+        if any("Vulnerability record" in line for line in lines):
+            lines.append(RECORD_LIMITS_NOTE)
         for vendor in vendors:
             section = describe_vendor(conn, vendor)
             if section:
