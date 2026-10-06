@@ -20,6 +20,7 @@ import sys
 import assistant
 import cve_lookup
 import cwe_names
+import neighbourhood
 import rebuild
 from refresh_pipeline import refresh, STATUS_PATH
 
@@ -147,7 +148,6 @@ def load_data():
         "nodes": pd.read_csv(DATA_DIR / "cooccurrence_nodes.csv"),
         "edges": pd.read_csv(DATA_DIR / "cooccurrence_edges.csv"),
         "centrality_ts": pd.read_csv(DATA_DIR / "centrality_timeseries.csv"),
-        "forecast": pd.read_csv(DATA_DIR / "forecast_results.csv"),
         "coverage": pd.read_csv(DATA_DIR / "data_coverage.csv"),
     }
 
@@ -1048,6 +1048,178 @@ with tab_network:
             cve_browser("network", cwe_ids=(drill_cwe,))
 
 # ---------------------------------------------------------------------------
+# Weakness neighbourhood -- rendered inside the Centrality over time tab
+# ---------------------------------------------------------------------------
+NB_TOP_PARTNERS = 8  # rows in the over-time heatmap
+NB_MIN_YEAR_PRODUCTS = 10  # below this, a year's shares rest on too few products to show
+NB_TREND_YEARS = 3  # recent window compared against the one before it
+
+
+@st.cache_data(ttl=REFRESH_TTL_SECONDS, max_entries=32)
+def load_neighbourhood(cwe_id):
+    return neighbourhood.load(cwe_id)
+
+
+def render_neighbourhood(cwe_id):
+    try:
+        products, pairs = load_neighbourhood(cwe_id)
+    except neighbourhood.NotBuilt:
+        st.info("The neighbourhood needs the product-year table the Weakness "
+                "network rebuild writes. Run that stage from the sidebar.",
+                icon=":material/build:")
+        return
+    except neighbourhood.DataUnavailable:
+        st.info(DB_BUSY_MESSAGE, icon=":material/hourglass:")
+        return
+
+    products, pairs = clip(products), clip(pairs)
+    if products.empty:
+        st.caption(f"No products carry {cwe_id} in {period_start}–{period_end}.")
+        return
+
+    bucket = ["year", "vendor", "product"]
+    n_products = len(products)
+    n_together = len(pairs[bucket].drop_duplicates())
+    with st.container(horizontal=True):
+        st.metric("Product-years carrying it", f"{n_products:,}", border=True,
+                  help="Each product counts once per year it had this weakness.")
+        st.metric("Partner types", f"{pairs['partner'].nunique():,}", border=True,
+                  help="Distinct weakness types seen alongside it at least once.")
+        st.metric("Seen alongside another type", f"{n_together / n_products:.0%}", border=True,
+                  help="Share of its product-years where at least one other type "
+                       "also appeared. The rest are the product's only weakness that year.")
+
+    if pairs.empty:
+        st.caption(f"{cwe_id} never shares a product-year with another weakness type "
+                   f"in this period, so it sits outside the network.")
+        return
+
+    # Shares, not counts: product-years per year grew several-fold and recent
+    # vendor data is incomplete, so a raw count rises or falls for reasons
+    # that have nothing to do with the pairing.
+    per_year = products.groupby("year").size()
+    shared = pairs.groupby(["partner", "year"]).size().unstack(fill_value=0)
+    shared = shared.reindex(columns=per_year.index, fill_value=0)
+
+    years_sorted = sorted(per_year.index)
+    recent = years_sorted[-NB_TREND_YEARS:]
+    earlier = years_sorted[-2 * NB_TREND_YEARS:-NB_TREND_YEARS]
+
+    def window_share(years):
+        if not years or per_year[years].sum() == 0:
+            return pd.Series(float("nan"), index=shared.index)
+        return shared[years].sum(axis=1) / per_year[years].sum()
+
+    drawn = set()
+    for e in data["edges"].itertuples():
+        if cwe_id in (e.source, e.target):
+            drawn.add(e.target if e.source == cwe_id else e.source)
+
+    table = pd.DataFrame({
+        "partner": shared.index,
+        "shared": shared.sum(axis=1).values,
+        "share": (shared.sum(axis=1) / n_products).values,
+        "trend": (100 * (window_share(recent) - window_share(earlier))).values,
+        "first_year": pairs.groupby("partner")["year"].min().reindex(shared.index).values,
+    }).sort_values("shared", ascending=False).reset_index(drop=True)
+    table["name"] = table["partner"].map(lambda c: cwe_names.lookup(c) or "")
+    table["drawn"] = table["partner"].isin(drawn)
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown(f"**Types seen with {cwe_id}**")
+        event = st.dataframe(
+            table[["partner", "name", "shared", "share", "trend", "first_year", "drawn"]],
+            hide_index=True, width='stretch', height=360,
+            on_select="rerun", selection_mode="single-row", key=f"nb_table_{cwe_id}",
+            column_config={
+                "partner": "CWE", "name": "Name",
+                "shared": st.column_config.NumberColumn(
+                    "Product-years", help="Product-years where both appeared."),
+                "share": st.column_config.ProgressColumn(
+                    "Share", format="percent", min_value=0, max_value=1,
+                    help=f"Of {cwe_id}'s product-years, how many also had this type."),
+                "trend": st.column_config.NumberColumn(
+                    "Recent shift", format="%+.1f pts",
+                    help=f"Share over the last {NB_TREND_YEARS} years of the period "
+                         f"minus the {NB_TREND_YEARS} before, in percentage points."),
+                "first_year": st.column_config.NumberColumn("Since", format="%d"),
+                "drawn": st.column_config.CheckboxColumn(
+                    "On network chart",
+                    help="The network chart draws only each type's five strongest "
+                         "links, so most pairings here are real but not drawn."),
+            },
+        )
+        st.caption("Select a row to see the products behind that pairing. "
+                   "Recent shift compares the latest years with the ones before, "
+                   "so a positive figure means the two travel together more often now.")
+
+    with right:
+        st.markdown("**Pairings over time**")
+        top = table["partner"].head(NB_TOP_PARTNERS).tolist()
+        shown_years = [y for y in years_sorted if per_year[y] >= NB_MIN_YEAR_PRODUCTS]
+        if not shown_years:
+            st.caption(f"No year in the period has {NB_MIN_YEAR_PRODUCTS} or more "
+                       f"product-years for {cwe_id}, too few to chart shares.")
+        else:
+            z = (shared.loc[top, shown_years] / per_year[shown_years]) * 100
+            fig = go.Figure(go.Heatmap(
+                z=z.values, x=[str(y) for y in shown_years], y=top,
+                colorscale=[[0, "#1E3A5F"], [0.5, "#2DD4BF"], [1, "#F97316"]],
+                colorbar=dict(title="%", tickfont=dict(color=COLORS["muted"])),
+                hovertemplate="%{y} in %{x}: %{z:.1f}% of product-years<extra></extra>",
+            ))
+            fig.update_layout(**PLOTLY_LAYOUT, height=360)
+            fig.update_yaxes(autorange="reversed")
+            fig.update_xaxes(type="category")
+            st.plotly_chart(fig, width='stretch')
+            st.caption(
+                f"The {len(top)} most frequent partners, top to bottom. Each cell is "
+                f"the share of {cwe_id}'s products that year that also had the "
+                f"partner, so warmer means the two travelled together more often. "
+                f"Years with fewer than {NB_MIN_YEAR_PRODUCTS} products are left out."
+            )
+
+    selected_rows = event.selection.rows
+    if selected_rows and selected_rows[0] < len(table):
+        partner = table.iloc[selected_rows[0]]["partner"]
+        drivers = (pairs[pairs["partner"] == partner]
+                   .groupby(["vendor", "product"])["year"]
+                   .agg(years="nunique", first="min", last="max").reset_index()
+                   .sort_values(["years", "last"], ascending=False))
+        st.markdown(f"**Products where {cwe_id} and {partner} appear together**")
+        st.dataframe(
+            drivers, hide_index=True, width='stretch', height=280,
+            column_config={
+                "vendor": "Vendor", "product": "Product",
+                "years": st.column_config.NumberColumn("Years together"),
+                "first": st.column_config.NumberColumn("First", format="%d"),
+                "last": st.column_config.NumberColumn("Latest", format="%d"),
+            },
+        )
+        st.caption(f"{len(drivers):,} products, most persistent first. A product "
+                   f"that pairs the two year after year points to a shared root "
+                   f"cause in its code, not a one-off.")
+    else:
+        hubs = (pairs.groupby(["vendor", "product"])
+                .agg(partners=("partner", "nunique"), years=("year", "nunique"))
+                .reset_index().sort_values(["partners", "years"], ascending=False)
+                .head(15))
+        st.markdown(f"**Products where {cwe_id} travels with the most other types**")
+        st.dataframe(
+            hubs, hide_index=True, width='stretch', height=280,
+            column_config={
+                "vendor": "Vendor", "product": "Product",
+                "partners": st.column_config.NumberColumn("Partner types"),
+                "years": st.column_config.NumberColumn("Years"),
+            },
+        )
+        st.caption("These products give this weakness its connections. Each "
+                   "vulnerability counts under one weakness type, as in every "
+                   "other view, and recent years are missing some vendor data.")
+
+
+# ---------------------------------------------------------------------------
 # Tab 4 -- Centrality over time
 # ---------------------------------------------------------------------------
 with tab_centrality:
@@ -1146,67 +1318,24 @@ with tab_centrality:
             )
 
     st.markdown("---")
-    st.markdown("**Can this year's network position predict next year's?**")
-
-    fc = data["forecast"]
-    mae_model = (fc["actual_next_centrality"] - fc["predicted_next_centrality"]).abs().mean()
-    mae_naive = (fc["actual_next_centrality"] - fc["naive_predicted_next_centrality"]).abs().mean()
-    true_dir = fc["actual_next_centrality"] > fc["current_centrality"]
-    pred_dir = fc["predicted_next_centrality"] > fc["current_centrality"]
-    dir_acc = (true_dir == pred_dir).mean()
-
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.markdown(f'<div class="stat-card"><div class="stat-value">{mae_model:.4f}</div>'
-                     f'<div class="stat-label">Model MAE (test)</div></div>', unsafe_allow_html=True)
-    with m2:
-        st.markdown(f'<div class="stat-card"><div class="stat-value">{mae_naive:.4f}</div>'
-                     f'<div class="stat-label">Naive baseline MAE</div></div>', unsafe_allow_html=True)
-    with m3:
-        st.markdown(f'<div class="stat-card"><div class="stat-value">{dir_acc:.1%}</div>'
-                     f'<div class="stat-label">Direction accuracy</div></div>', unsafe_allow_html=True)
-
-    _beats_naive = mae_model < mae_naive
-    _beats_coin = dir_acc > 0.5
-    _verdict = (
-        f'<b>The model {"beats" if _beats_naive else "does not beat"} the naive '
-        f'"predict no change" baseline, and its direction call is '
-        f'{"better" if _beats_coin else "no better"} than a coin flip.</b> '
-    )
+    st.markdown("**Weakness neighbourhood**")
     st.markdown(
-        f'<div class="section-note">{_verdict}'
-        f'Trained on year-over-year changes through {int(fc["feature_year"].max())}. '
-        f'Treat it as an illustration of the approach, not something to plan '
-        f'against: it leans almost entirely on the previous year\'s value, which '
-        f'makes it closer to "assume no change" than a genuine forecast.</div>',
+        '<div class="section-note">What a weakness type\'s centrality is made of: the '
+        'other types that turn up in the same product in the same year, how those '
+        'pairings have shifted, and which products they come from. Built from the same '
+        'product-year groups as the Weakness network, within the chart period above.</div>',
         unsafe_allow_html=True,
     )
-
-    fig = go.Figure()
-    lims = [fc[["current_centrality", "actual_next_centrality", "predicted_next_centrality"]].min().min(),
-            fc[["current_centrality", "actual_next_centrality", "predicted_next_centrality"]].max().max()]
-    fig.add_trace(go.Scatter(x=lims, y=lims, mode="lines", line=dict(color=COLORS["muted"], dash="dash"),
-                              name="Perfect prediction", hoverinfo="skip"))
-    fig.add_trace(go.Scatter(
-        x=fc["actual_next_centrality"], y=fc["predicted_next_centrality"], mode="markers",
-        marker=dict(color=COLORS["signal"], size=7, opacity=0.6),
-        name="Model prediction", text=fc["cwe_id"], hovertemplate="%{text}<br>actual=%{x:.4f}<br>pred=%{y:.4f}",
-    ))
-    _target_year = int(fc["feature_year"].max()) + 1
-    fig.update_layout(**PLOTLY_LAYOUT, height=420,
-                       xaxis_title=f"Actual {_target_year} centrality",
-                       yaxis_title=f"Predicted {_target_year} centrality")
-    st.plotly_chart(fig, width='stretch')
-    st.caption(
-        f"Each dot is one weakness type: what the model predicted its "
-        f"{_target_year} centrality would be (vertical) against what it turned "
-        f"out to be (horizontal). The dashed line is a perfect prediction — "
-        f"dots on it were called exactly right, dots above it were "
-        f"over-predicted, below under-predicted. Hover for the weakness type. "
-        f"The tight diagonal cluster is less impressive than it looks: the "
-        f"model mostly repeats the previous year's value, and most weakness "
-        f"types genuinely do not move much year to year."
-    )
+    _by_centrality = data["nodes"].sort_values("centrality", ascending=False)["cwe_id"].tolist()
+    _nb_default = selected[0] if selected and selected[0] in _by_centrality else _by_centrality[0]
+    _nb_col, _ = st.columns([2, 3])
+    with _nb_col:
+        nb_cwe = st.selectbox(
+            "Weakness type", _by_centrality, index=_by_centrality.index(_nb_default),
+            format_func=cwe_names.label, key="nb_cwe",
+            help="Most central first. Starts on the first type charted above.",
+        )
+    render_neighbourhood(nb_cwe)
 
 # ---------------------------------------------------------------------------
 # Tab 5 -- Data coverage

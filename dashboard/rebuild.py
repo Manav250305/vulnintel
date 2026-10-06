@@ -3,7 +3,7 @@ Run the heavy analysis stages that the quick refresh deliberately skips.
 
 The quick refresh only reloads CVE records and rebuilds the SQL trend views,
 because everything else -- text clustering, the weakness-relationship network,
-vendor profiles, the forecast -- takes minutes to hours and would make a
+vendor profiles, the centrality history -- takes minutes to hours and would make a
 routine data pull unusable. Those stages live here instead, each one startable
 on its own.
 
@@ -83,19 +83,18 @@ STAGES = {
         "artifacts": ["vendor_cluster_map.csv"],
     },
     "centrality": {
-        "title": "Centrality history and forecast",
-        "blurb": "Rebuilds the per-year centrality series and retrains the "
-                 "next-year forecast.",
+        "title": "Centrality history",
+        "blurb": "Rebuilds the per-year centrality series.",
         "runtime": "~2 minutes",
         "updates": ["Centrality Time Series"],
-        # Reads the fixed weakness index the network stage writes, and the
-        # clustering tables the text stage writes.
-        "depends_on": ["network", "text"],
+        # Reads the fixed weakness index the network stage writes. The
+        # next-year forecast (models/train_forecast.py) is no longer part of
+        # this stage or the dashboard; it is kept as offline work.
+        "depends_on": ["network"],
         "steps": [
             ([PYTHON, "build_centrality_timeseries.py"], PROJECT_ROOT / "models"),
-            ([PYTHON, "train_forecast.py"], PROJECT_ROOT / "models"),
         ],
-        "artifacts": ["centrality_timeseries.csv", "forecast_results.csv"],
+        "artifacts": ["centrality_timeseries.csv"],
     },
     "classifier": {
         "title": "Weakness classifier",

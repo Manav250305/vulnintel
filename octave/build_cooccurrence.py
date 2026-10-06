@@ -107,6 +107,29 @@ def main():
     for count, a, b in sorted(pairs, reverse=True)[:10]:
         print(f"  {a} <-> {b}: {count}")
 
+    # Persist the buckets themselves, so the dashboard can show which
+    # products and years stand behind any one edge. Rebuilding them on demand
+    # means recomputing the canonical CWE of every record (several seconds per
+    # question); storing the exact rows this matrix was summed from also keeps
+    # the two from ever disagreeing.
+    conn.execute("DROP TABLE IF EXISTS cwe_bucket")
+    conn.execute("""
+        CREATE TABLE cwe_bucket (
+            vendor TEXT NOT NULL, product TEXT NOT NULL,
+            year INTEGER NOT NULL, cwe_id TEXT NOT NULL
+        )
+    """)
+    conn.executemany(
+        "INSERT INTO cwe_bucket (vendor, product, year, cwe_id) VALUES (?, ?, ?, ?)",
+        ((vendor, product, year, cwe) for (vendor, product, year), cwe_set in buckets.items()
+         for cwe in cwe_set),
+    )
+    conn.execute("CREATE INDEX idx_cwe_bucket_cwe ON cwe_bucket(cwe_id, year)")
+    conn.execute("CREATE INDEX idx_cwe_bucket_bucket ON cwe_bucket(vendor, product, year)")
+    conn.commit()
+    n_rows = conn.execute("SELECT COUNT(*) FROM cwe_bucket").fetchone()[0]
+    print(f"\nWrote table cwe_bucket ({n_rows:,} vendor-product-year-CWE rows)")
+
     conn.close()
 
 
