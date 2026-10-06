@@ -419,53 +419,33 @@ st.markdown(
 )
 st.write("")
 
-# ---------------------------------------------------------------------------
-# Period filter
-# ---------------------------------------------------------------------------
 COMPLETE_CPE_COVERAGE_PCT = 85.0  # below this, vendor counts are visibly short
 QUIET_YEAR_SHARE = 0.02  # a year under this share of the busiest one reads as flat
+MIN_CVES_FOR_GROWTH = 50  # below this, a growth percentage is noise, not signal
 
 cov = data["coverage"].sort_values("year")
+all_years = sorted(int(y) for y in cov["year"].unique())
 
-# NVD backdates its oldest records, so the early years hold a few hundred
-# entries against tens of thousands today. Charted in full they occupy a third
-# of the axis as a flat line and squash everything recent, so the default view
-# starts where the data becomes substantial. The full span stays selectable.
-_peak = cov["total_cves"].max()
-_substantial = cov[cov["total_cves"] >= QUIET_YEAR_SHARE * _peak]["year"]
-default_start = int(_substantial.min()) if not _substantial.empty else yr_min
-
-period = st.slider(
-    "Period shown", min_value=yr_min, max_value=yr_max,
-    value=(default_start, yr_max),
-    help="Applies to every chart below that is plotted over time.",
+# ---------------------------------------------------------------------------
+# Snapshot year -- drives the cards only, independent of the chart period
+# ---------------------------------------------------------------------------
+snapshot_year = st.selectbox(
+    "Snapshot year", options=list(reversed(all_years)), index=0,
+    help="Which year the cards below report. Independent of the chart period.",
 )
-period_start, period_end = int(period[0]), int(period[1])
 
+top_vendor = data["vendor_year"][data["vendor_year"]["year"] == snapshot_year].nlargest(1, "cve_count")
 
-def clip(frame, column="year"):
-    """Restrict a frame to the selected period."""
-    return frame[(frame[column] >= period_start) & (frame[column] <= period_end)]
+# A weakness going from 1 record to 39 is +3800% and means nothing. The SQL
+# layer already screens these out before quoting growth; the card now applies
+# the same floor rather than headlining a rounding artifact.
+_growth_pool = data["cwe_year"][(data["cwe_year"]["year"] == snapshot_year) &
+                                 (data["cwe_year"]["yoy_growth_pct"].notna()) &
+                                 (data["cwe_year"]["cve_count"] >= MIN_CVES_FOR_GROWTH)]
+fastest_cwe = _growth_pool.nlargest(1, "yoy_growth_pct")
 
-
-if (period_start, period_end) != (yr_min, yr_max):
-    st.caption(
-        f"Showing {period_start}–{period_end} of {yr_min}–{yr_max} "
-        f"available. Vendor groupings and the weakness network are pooled across "
-        f"all years and do not change with this setting."
-    )
-
-st.write("")
-
-# ---------------------------------------------------------------------------
-# Stat cards -- reported for the end of the selected period
-# ---------------------------------------------------------------------------
-top_vendor = data["vendor_year"][data["vendor_year"]["year"] == period_end].nlargest(1, "cve_count")
-fastest_cwe = data["cwe_year"][(data["cwe_year"]["year"] == period_end) &
-                                 (data["cwe_year"]["yoy_growth_pct"].notna())].nlargest(1, "yoy_growth_pct")
-
-cov_recent = cov[(cov["year"] <= period_end) & (cov["year"] >= period_end - 9)]
-latest_cov = cov[cov["year"] == period_end].iloc[0]
+cov_recent = cov[(cov["year"] <= snapshot_year) & (cov["year"] >= snapshot_year - 9)]
+latest_cov = cov[cov["year"] == snapshot_year].iloc[0]
 
 # Walk back from the newest year while coverage stays low, so the flagged
 # span is the current backlog rather than every dip in NVD's history.
@@ -474,7 +454,7 @@ for _, row in cov.sort_values("year", ascending=False).iterrows():
     if row["cpe_coverage_pct"] >= COMPLETE_CPE_COVERAGE_PCT:
         break
     undercounted_from = int(row["year"])
-_prior = cov[cov["year"] == period_end - 1]
+_prior = cov[cov["year"] == snapshot_year - 1]
 prev_total = _prior["total_cves"].iloc[0] if not _prior.empty else None
 cve_growth = (100.0 * (latest_cov["total_cves"] - prev_total) / prev_total
               if prev_total else None)
@@ -483,25 +463,72 @@ cov_delta = (latest_cov["cpe_coverage_pct"] - _prior["cpe_coverage_pct"].iloc[0]
 
 with st.container(horizontal=True):
     st.metric(
-        f"CVEs published in {period_end}", f"{int(latest_cov['total_cves']):,}",
-        f"{cve_growth:+.0f}% vs {period_end - 1}" if cve_growth is not None else None,
+        f"CVEs published in {snapshot_year}", f"{int(latest_cov['total_cves']):,}",
+        f"{cve_growth:+.0f}% vs {snapshot_year - 1}" if cve_growth is not None else None,
         border=True,
         chart_data=cov_recent["total_cves"].tolist(), chart_type="line",
     )
     st.metric(
-        f"Top vendor by CVEs, {period_end}", top_vendor.iloc[0]["vendor"].title(),
-        f"{int(top_vendor.iloc[0]['cve_count']):,} CVEs", border=True, delta_color="off",
+        f"Top vendor by CVEs, {snapshot_year}",
+        top_vendor.iloc[0]["vendor"].title() if not top_vendor.empty else "—",
+        f"{int(top_vendor.iloc[0]['cve_count']):,} CVEs" if not top_vendor.empty else None,
+        border=True, delta_color="off",
     )
     st.metric(
-        f"Fastest-growing CWE, {period_end}", fastest_cwe.iloc[0]["cwe_id"],
-        f"{fastest_cwe.iloc[0]['yoy_growth_pct']:+.0f}% YoY", border=True,
+        f"Fastest-growing CWE, {snapshot_year}",
+        fastest_cwe.iloc[0]["cwe_id"] if not fastest_cwe.empty else "—",
+        (f"{fastest_cwe.iloc[0]['yoy_growth_pct']:+.0f}% YoY, "
+         f"{int(fastest_cwe.iloc[0]['cve_count']):,} CVEs") if not fastest_cwe.empty else None,
+        border=True,
+        help=f"Largest year-on-year rise among weakness types with at least "
+             f"{MIN_CVES_FOR_GROWTH} vulnerabilities that year. Without that floor a "
+             f"type going from 1 record to 39 would top the list at +3800%.",
     )
     st.metric(
-        f"Vendor attribution, {period_end}", f"{latest_cov['cpe_coverage_pct']:.0f}%",
+        f"Vendor attribution, {snapshot_year}", f"{latest_cov['cpe_coverage_pct']:.0f}%",
         f"{cov_delta:+.0f} pts" if cov_delta is not None else None,
         border=True, help="Share of CVEs with CPE vendor/product data. NVD adds these "
                           "after publication, so recent years undercount vendor activity.",
         chart_data=cov_recent["cpe_coverage_pct"].tolist(), chart_type="line",
+    )
+
+st.write("")
+
+# ---------------------------------------------------------------------------
+# Chart period -- governs the time-series charts in the tabs below
+# ---------------------------------------------------------------------------
+# NVD backdates its oldest records, so the early years hold a few hundred
+# entries against tens of thousands today. Charted in full they occupy a third
+# of the axis as a flat line and squash everything recent, so the default view
+# starts where the data becomes substantial. The full span stays selectable.
+_peak = cov["total_cves"].max()
+_substantial = cov[cov["total_cves"] >= QUIET_YEAR_SHARE * _peak]["year"]
+default_start = int(_substantial.min()) if not _substantial.empty else yr_min
+
+_from_col, _to_col, _ = st.columns([1, 1, 3])
+with _from_col:
+    period_start = st.selectbox(
+        "Charts from", options=all_years, index=all_years.index(default_start),
+        help="First year shown in the time charts below.",
+    )
+with _to_col:
+    _to_options = [y for y in all_years if y >= period_start]
+    period_end = st.selectbox(
+        "Charts to", options=_to_options, index=len(_to_options) - 1,
+        help="Last year shown in the time charts below.",
+    )
+
+
+def clip(frame, column="year"):
+    """Restrict a frame to the selected chart period."""
+    return frame[(frame[column] >= period_start) & (frame[column] <= period_end)]
+
+
+if (period_start, period_end) != (yr_min, yr_max):
+    st.caption(
+        f"Charts show {period_start}–{period_end} of {yr_min}–{yr_max} "
+        f"available. Vendor groupings and the weakness network are pooled across "
+        f"all years and do not change with this setting."
     )
 
 st.write("")
