@@ -1103,11 +1103,27 @@ with tab_centrality:
             st.markdown("**Biggest movers**")
             st.info("Select a period covering at least two years to compare movement.")
         else:
+            st.markdown("**Biggest movers**")
 
-            st.markdown(f"**Biggest movers, {ts_prev} \u2192 {ts_latest}**")
-            piv = ts[ts["year"].isin([ts_prev, ts_latest])].pivot(index="cwe_id", columns="year", values="centrality")
+            # Defaults to the two most recent years, but any pair inside the
+            # period can be compared -- a one-year step shows what moved most
+            # recently, a longer span shows which shifts actually persisted.
+            year_options = [int(y) for y in ts_years]
+            _from_col, _to_col = st.columns(2)
+            with _from_col:
+                move_from = st.selectbox(
+                    "Compare from", year_options,
+                    index=year_options.index(ts_prev), key="movers_from",
+                )
+            with _to_col:
+                _later = [y for y in year_options if y > move_from]
+                move_to = st.selectbox(
+                    "to", _later, index=len(_later) - 1, key="movers_to",
+                )
+
+            piv = ts[ts["year"].isin([move_from, move_to])].pivot(index="cwe_id", columns="year", values="centrality")
             piv = piv.dropna()
-            piv["change"] = piv[ts_latest] - piv[ts_prev]
+            piv["change"] = piv[move_to] - piv[move_from]
             movers = pd.concat([piv.nlargest(5, "change"), piv.nsmallest(5, "change")]).reset_index()
             movers = movers.sort_values("change")
             fig = px.bar(
@@ -1120,11 +1136,13 @@ with tab_centrality:
             st.plotly_chart(fig, width='stretch')
             st.caption(
                 f"The five weakness types that gained the most network centrality "
-                f"between {ts_prev} and {ts_latest}, and the five that lost the most. "
+                f"between {move_from} and {move_to}, and the five that lost the most. "
                 f"Green bars extend right (gained), red bars left (lost). A gain "
                 f"means the weakness started appearing alongside a wider range of "
                 f"other flaw types — an early signal that it is spreading into "
-                f"new kinds of software, which often precedes a rise in raw counts."
+                f"new kinds of software, which often precedes a rise in raw counts. "
+                f"Only the two chosen years are compared, so a wider gap hides "
+                f"whatever happened in between."
             )
 
     st.markdown("---")
